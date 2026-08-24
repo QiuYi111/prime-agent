@@ -310,6 +310,21 @@ export interface ExtensionContext {
 	getSystemPrompt(): string;
 }
 
+export type KernelHostRequestHandler = (
+	payload: Record<string, unknown>,
+	ctx: ExtensionContext,
+) => Promise<Record<string, unknown>> | Record<string, unknown>;
+
+/** Typed request handled by the TypeScript host on behalf of kernel code. */
+export interface KernelHostRequestRegistration {
+	type: string;
+	handler: KernelHostRequestHandler;
+}
+
+export interface RegisteredKernelHostRequest extends KernelHostRequestRegistration {
+	sourceInfo: SourceInfo;
+}
+
 /**
  * Extended context for command handlers.
  * Includes session control methods only safe in user-initiated commands.
@@ -1037,6 +1052,8 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+	/** Register a typed request handled by the host for code running in the session kernel. */
+	registerKernelHostRequest(registration: KernelHostRequestRegistration): void;
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 
@@ -1417,6 +1434,7 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	kernelHostRequests?: Map<string, RegisteredKernelHostRequest>;
 }
 
 /** Result of loading extensions. */
