@@ -74,6 +74,7 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	promptCacheBreakpoints?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -118,9 +119,12 @@ export function convertResponsesMessages<TApi extends Api>(
 	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
 	if (includeSystemPrompt && context.systemPrompt) {
 		const role = model.reasoning ? "developer" : "system";
+		const promptContent = options?.promptCacheBreakpoints
+			? buildPromptCacheableSystemContent(sanitizeSurrogates(context.systemPrompt))
+			: sanitizeSurrogates(context.systemPrompt);
 		messages.push({
 			role,
-			content: sanitizeSurrogates(context.systemPrompt),
+			content: promptContent,
 		});
 	}
 
@@ -251,7 +255,70 @@ export function convertResponsesMessages<TApi extends Api>(
 		msgIndex++;
 	}
 
+	if (options?.promptCacheBreakpoints) {
+		const explicitSystemBreakpoints = countPromptCacheBreakpoints(messages);
+		addRollingPromptCacheBreakpoints(messages, Math.max(0, 3 - explicitSystemBreakpoints));
+	}
+
 	return messages;
+}
+
+type CacheableResponseInputText = ResponseInputText & {
+	prompt_cache_breakpoint?: { mode: "explicit" };
+};
+
+const CONTINUAL_HARNESS_HEADING = "# Continual Harness State";
+
+function cacheableInputText(text: string): CacheableResponseInputText {
+	return { type: "input_text", text, prompt_cache_breakpoint: { mode: "explicit" } };
+}
+
+function buildPromptCacheableSystemContent(systemPrompt: string): CacheableResponseInputText[] {
+	const harnessStart = systemPrompt.indexOf(CONTINUAL_HARNESS_HEADING);
+	if (harnessStart <= 0) return [cacheableInputText(systemPrompt)];
+
+	// Refinement changes the continual harness suffix. A boundary immediately
+	// before it preserves the tools + base prompt prefix across that update, while
+	// the second boundary caches the complete current system prompt.
+	return [
+		cacheableInputText(systemPrompt.slice(0, harnessStart)),
+		cacheableInputText(systemPrompt.slice(harnessStart)),
+	];
+}
+
+function countPromptCacheBreakpoints(messages: ResponseInput): number {
+	let count = 0;
+	for (const item of messages) {
+		if (!("content" in item) || !Array.isArray(item.content)) continue;
+		for (const content of item.content) {
+			if ((content as CacheableResponseInputText).prompt_cache_breakpoint) count++;
+		}
+	}
+	return count;
+}
+
+/**
+ * Keep two reusable conversation checkpoints in addition to the fixed system
+ * prompt checkpoint. GPT-5.6 implicit mode supplies the fourth, latest checkpoint.
+ */
+function addRollingPromptCacheBreakpoints(messages: ResponseInput, maxBreakpoints: number): void {
+	if (maxBreakpoints <= 0) return;
+	const candidates: CacheableResponseInputText[] = [];
+	const lastItem = messages.at(-1);
+
+	for (const item of messages) {
+		if (!("role" in item) || item.role !== "user" || !Array.isArray(item.content)) continue;
+		for (const content of item.content) {
+			if (content.type === "input_text") candidates.push(content as CacheableResponseInputText);
+		}
+	}
+
+	// The implicit breakpoint already covers a latest user message. When the
+	// request ends in a tool result, its preceding user message remains useful.
+	if (lastItem && "role" in lastItem && lastItem.role === "user") candidates.pop();
+	for (const content of candidates.slice(-maxBreakpoints)) {
+		content.prompt_cache_breakpoint = { mode: "explicit" };
+	}
 }
 
 export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
@@ -476,15 +543,28 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			if (response?.usage) {
 				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+				const cacheWriteTokens = response.usage.input_tokens_details?.cache_write_tokens || 0;
 				output.usage = {
-					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
-					input: (response.usage.input_tokens || 0) - cachedTokens,
+					// OpenAI includes cache reads and writes in input_tokens.
+					input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
 					output: response.usage.output_tokens || 0,
 					cacheRead: cachedTokens,
-					cacheWrite: 0,
+					cacheWrite: cacheWriteTokens,
 					totalTokens: response.usage.total_tokens || 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};
+			}
+			const promptCacheDiagnostics = (response as unknown as { prompt_cache_diagnostics?: unknown })
+				.prompt_cache_diagnostics;
+			if (promptCacheDiagnostics !== undefined) {
+				output.diagnostics = [
+					...(output.diagnostics ?? []),
+					{
+						type: "prompt_cache",
+						timestamp: Date.now(),
+						details: { promptCacheDiagnostics },
+					},
+				];
 			}
 			calculateCost(model, output.usage);
 			if (options?.applyServiceTierPricing) {

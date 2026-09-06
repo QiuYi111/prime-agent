@@ -84,6 +84,11 @@ interface RequestBody {
 	text?: { verbosity?: string };
 	include?: string[];
 	prompt_cache_key?: string;
+	prompt_cache_options?: {
+		mode?: "implicit" | "explicit";
+		ttl?: "30m";
+		comparison_response_id?: string;
+	};
 	[key: string]: unknown;
 }
 
@@ -181,6 +186,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					if (options?.signal?.aborted) {
 						throw new Error("Request was aborted");
 					}
+					rememberPromptCacheResponse(options?.sessionId, output.responseId);
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -278,6 +284,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
+			rememberPromptCacheResponse(options?.sessionId, output.responseId);
 
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -321,19 +328,33 @@ function buildRequestBody(
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): RequestBody {
-	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
-		includeSystemPrompt: false,
+	const usesGpt56PromptCaching = isGpt56OrLater(model.id) && options?.cacheRetention !== "none";
+	const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+	const promptContext = usesGpt56PromptCaching
+		? { ...context, systemPrompt: context.systemPrompt || "You are a helpful assistant." }
+		: context;
+	const messages = convertResponsesMessages(model, promptContext, CODEX_TOOL_CALL_PROVIDERS, {
+		includeSystemPrompt: usesGpt56PromptCaching,
+		promptCacheBreakpoints: usesGpt56PromptCaching,
 	});
+	const comparisonResponseId = cacheSessionId ? promptCacheComparisonResponseIds.get(cacheSessionId) : undefined;
 
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
 		stream: true,
-		instructions: context.systemPrompt || "You are a helpful assistant.",
+		instructions: usesGpt56PromptCaching ? undefined : context.systemPrompt || "You are a helpful assistant.",
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
-		prompt_cache_key: options?.sessionId,
+		prompt_cache_key: cacheSessionId,
+		prompt_cache_options: usesGpt56PromptCaching
+			? {
+					mode: "implicit",
+					ttl: "30m",
+					...(comparisonResponseId ? { comparison_response_id: comparisonResponseId } : {}),
+				}
+			: undefined,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};
@@ -364,6 +385,14 @@ function buildRequestBody(
 	}
 
 	return body;
+}
+
+function isGpt56OrLater(modelId: string): boolean {
+	const match = /^gpt-(\d+)\.(\d+)/.exec(modelId);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 5 || (major === 5 && minor >= 6);
 }
 
 // Multipliers per https://developers.openai.com/api/docs/pricing (retrieved 2026-08-21)
@@ -600,6 +629,11 @@ export interface OpenAICodexWebSocketDebugStats {
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
+const promptCacheComparisonResponseIds = new Map<string, string>();
+
+function rememberPromptCacheResponse(sessionId: string | undefined, responseId: string | undefined): void {
+	if (sessionId && responseId) promptCacheComparisonResponseIds.set(sessionId, responseId);
+}
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
 	let stats = websocketDebugStats.get(sessionId);
@@ -645,12 +679,14 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		const entry = websocketSessionCache.get(sessionId);
 		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
+		promptCacheComparisonResponseIds.delete(sessionId);
 		return;
 	}
 	for (const entry of websocketSessionCache.values()) {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+	promptCacheComparisonResponseIds.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -1038,11 +1074,15 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 
 function requestBodyWithoutInput(body: RequestBody): RequestBody {
 	const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
-	return rest;
+	if (!rest.prompt_cache_options?.comparison_response_id) return rest;
+	const { comparison_response_id: _comparisonResponseId, ...promptCacheOptions } = rest.prompt_cache_options;
+	return { ...rest, prompt_cache_options: promptCacheOptions };
 }
 
 function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | undefined): boolean {
-	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+	const withoutCacheMetadata = (input: ResponseInput | undefined) =>
+		JSON.stringify(input ?? [], (key, value) => (key === "prompt_cache_breakpoint" ? undefined : value));
+	return withoutCacheMetadata(a) === withoutCacheMetadata(b);
 }
 
 function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {

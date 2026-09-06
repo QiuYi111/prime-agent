@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { clampThinkingLevel } from "../models.js";
+import { registerSessionResourceCleanup } from "../session-resources.js";
 import type {
 	Api,
 	AssistantMessage,
@@ -27,6 +28,12 @@ import { convertResponsesMessages, convertResponsesTools, processResponsesStream
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const promptCacheComparisonResponseIds = new Map<string, string>();
+
+registerSessionResourceCleanup((sessionId) => {
+	if (sessionId) promptCacheComparisonResponseIds.delete(sessionId);
+	else promptCacheComparisonResponseIds.clear();
+});
 
 /**
  * Resolve cache retention preference.
@@ -96,7 +103,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
-				params = nextParams as ResponseCreateParamsStreaming;
+				params = nextParams as typeof params;
 			}
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
@@ -112,6 +119,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				serviceTier: options?.serviceTier,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
+			if (cacheSessionId && output.responseId) {
+				promptCacheComparisonResponseIds.set(cacheSessionId, output.responseId);
+			}
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -216,16 +226,33 @@ function createClient(
 }
 
 function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
-
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	const usesGpt56PromptCaching = isGpt56OrLater(model.id) && cacheRetention !== "none";
+	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+		promptCacheBreakpoints: usesGpt56PromptCaching,
+	});
 	const compat = getCompat(model);
-	const params: ResponseCreateParamsStreaming = {
+	const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
+	const comparisonResponseId = cacheSessionId ? promptCacheComparisonResponseIds.get(cacheSessionId) : undefined;
+	const params: ResponseCreateParamsStreaming & {
+		prompt_cache_options?: {
+			mode: "implicit";
+			ttl: "30m";
+			comparison_response_id?: string;
+		};
+	} = {
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		prompt_cache_key: cacheSessionId,
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
+		prompt_cache_options: usesGpt56PromptCaching
+			? {
+					mode: "implicit",
+					ttl: "30m",
+					...(comparisonResponseId ? { comparison_response_id: comparisonResponseId } : {}),
+				}
+			: undefined,
 		store: false,
 	};
 
@@ -263,6 +290,14 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	}
 
 	return params;
+}
+
+function isGpt56OrLater(modelId: string): boolean {
+	const match = /^gpt-(\d+)\.(\d+)/.exec(modelId);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 5 || (major === 5 && minor >= 6);
 }
 
 // Multipliers per https://developers.openai.com/api/docs/pricing (retrieved 2026-08-21)
