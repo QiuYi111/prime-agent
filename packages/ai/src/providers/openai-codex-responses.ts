@@ -39,6 +39,7 @@ import {
 	formatThrownValue,
 } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { shortHash } from "../utils/hash.js";
 import { headersToRecord } from "../utils/headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -151,6 +152,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
+			const promptCacheRequestDiagnostic = buildPromptCacheRequestDiagnostic(options?.sessionId, body);
+			if (promptCacheRequestDiagnostic) {
+				appendAssistantMessageDiagnostic(output, promptCacheRequestDiagnostic);
+			}
 			const websocketRequestId = options?.sessionId || createCodexRequestId();
 			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
 			const websocketHeaders = buildWebSocketHeaders(
@@ -186,7 +191,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					if (options?.signal?.aborted) {
 						throw new Error("Request was aborted");
 					}
-					rememberPromptCacheResponse(options?.sessionId, output.responseId);
+					rememberPromptCacheRequest(options?.sessionId, body, output.responseId);
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -284,7 +289,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			rememberPromptCacheResponse(options?.sessionId, output.responseId);
+			rememberPromptCacheRequest(options?.sessionId, body, output.responseId);
 
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -630,8 +635,84 @@ const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
 const promptCacheComparisonResponseIds = new Map<string, string>();
+const promptCacheRequestSnapshots = new Map<string, PromptCacheRequestSnapshot>();
 
-function rememberPromptCacheResponse(sessionId: string | undefined, responseId: string | undefined): void {
+interface PromptCacheRequestSnapshot {
+	modelConfigHash: string;
+	systemHash: string;
+	toolsHash: string;
+	inputItemHashes: string[];
+}
+
+function hashPromptCacheValue(value: unknown): string {
+	return shortHash(JSON.stringify(value));
+}
+
+function buildPromptCacheRequestSnapshot(body: RequestBody): PromptCacheRequestSnapshot {
+	const input = body.input ?? [];
+	const systemItems = input.filter((item) => "role" in item && (item.role === "developer" || item.role === "system"));
+	const { input: _input, tools: _tools, instructions: _instructions, prompt_cache_options, ...config } = body;
+	const { comparison_response_id: _comparisonResponseId, ...stablePromptCacheOptions } = prompt_cache_options ?? {};
+	return {
+		modelConfigHash: hashPromptCacheValue({ ...config, prompt_cache_options: stablePromptCacheOptions }),
+		systemHash: hashPromptCacheValue({ instructions: body.instructions, systemItems }),
+		toolsHash: hashPromptCacheValue(body.tools ?? []),
+		inputItemHashes: input.map(hashPromptCacheValue),
+	};
+}
+
+function buildPromptCacheRequestDiagnostic(
+	sessionId: string | undefined,
+	body: RequestBody,
+): ReturnType<typeof createAssistantMessageDiagnostic> | undefined {
+	if (!sessionId || !isGpt56OrLater(body.model)) return undefined;
+	const current = buildPromptCacheRequestSnapshot(body);
+	const previous = promptCacheRequestSnapshots.get(sessionId);
+	let changedComponent = "first_request";
+	let firstDifferentInputItem: number | null = null;
+	let previousInputIsPrefix: boolean | null = null;
+
+	if (previous) {
+		if (previous.modelConfigHash !== current.modelConfigHash) changedComponent = "model_or_config";
+		else if (previous.toolsHash !== current.toolsHash) changedComponent = "tools";
+		else if (previous.systemHash !== current.systemHash) changedComponent = "system";
+		else {
+			const commonLength = Math.min(previous.inputItemHashes.length, current.inputItemHashes.length);
+			for (let index = 0; index < commonLength; index++) {
+				if (previous.inputItemHashes[index] !== current.inputItemHashes[index]) {
+					firstDifferentInputItem = index;
+					break;
+				}
+			}
+			previousInputIsPrefix =
+				firstDifferentInputItem === null && previous.inputItemHashes.length <= current.inputItemHashes.length;
+			changedComponent = previousInputIsPrefix ? "append_only" : "input";
+		}
+	}
+
+	return {
+		type: "prompt_cache_request",
+		timestamp: Date.now(),
+		details: {
+			changedComponent,
+			firstDifferentInputItem,
+			previousInputIsPrefix,
+			previousInputItems: previous?.inputItemHashes.length ?? 0,
+			currentInputItems: current.inputItemHashes.length,
+			modelConfigHash: current.modelConfigHash,
+			systemHash: current.systemHash,
+			toolsHash: current.toolsHash,
+			toolOrder: (body.tools ?? []).map((tool) => ("name" in tool ? tool.name : tool.type)),
+		},
+	};
+}
+
+function rememberPromptCacheRequest(
+	sessionId: string | undefined,
+	body: RequestBody,
+	responseId: string | undefined,
+): void {
+	if (sessionId) promptCacheRequestSnapshots.set(sessionId, buildPromptCacheRequestSnapshot(body));
 	if (sessionId && responseId) promptCacheComparisonResponseIds.set(sessionId, responseId);
 }
 
@@ -680,6 +761,7 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
 		promptCacheComparisonResponseIds.delete(sessionId);
+		promptCacheRequestSnapshots.delete(sessionId);
 		return;
 	}
 	for (const entry of websocketSessionCache.values()) {
@@ -687,6 +769,7 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 	}
 	websocketSessionCache.clear();
 	promptCacheComparisonResponseIds.clear();
+	promptCacheRequestSnapshots.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);

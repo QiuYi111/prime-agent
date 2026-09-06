@@ -240,8 +240,15 @@ export function convertResponsesMessages<TApi extends Api>(
 						});
 					}
 				}
+				if (options?.promptCacheBreakpoints && contentParts.length > 0) {
+					(contentParts.at(-1) as CacheableResponseInputContent).prompt_cache_breakpoint = {
+						mode: "explicit",
+					};
+				}
 
 				output = contentParts;
+			} else if (options?.promptCacheBreakpoints && hasText) {
+				output = [cacheableInputText(sanitizeSurrogates(textResult))];
 			} else {
 				output = sanitizeSurrogates(hasText ? textResult : hasImages ? "(see attached image)" : "");
 			}
@@ -256,14 +263,16 @@ export function convertResponsesMessages<TApi extends Api>(
 	}
 
 	if (options?.promptCacheBreakpoints) {
-		const explicitSystemBreakpoints = countPromptCacheBreakpoints(messages);
-		addRollingPromptCacheBreakpoints(messages, Math.max(0, 3 - explicitSystemBreakpoints));
+		addConversationPromptCacheBreakpoints(messages);
 	}
 
 	return messages;
 }
 
 type CacheableResponseInputText = ResponseInputText & {
+	prompt_cache_breakpoint?: { mode: "explicit" };
+};
+type CacheableResponseInputContent = ResponseFunctionCallOutputItemList[number] & {
 	prompt_cache_breakpoint?: { mode: "explicit" };
 };
 
@@ -286,38 +295,19 @@ function buildPromptCacheableSystemContent(systemPrompt: string): CacheableRespo
 	];
 }
 
-function countPromptCacheBreakpoints(messages: ResponseInput): number {
-	let count = 0;
-	for (const item of messages) {
-		if (!("content" in item) || !Array.isArray(item.content)) continue;
-		for (const content of item.content) {
-			if ((content as CacheableResponseInputText).prompt_cache_breakpoint) count++;
-		}
-	}
-	return count;
-}
-
 /**
- * Keep two reusable conversation checkpoints in addition to the fixed system
- * prompt checkpoint. GPT-5.6 implicit mode supplies the fourth, latest checkpoint.
+ * Mark each user message when it first enters the request. The markers must be
+ * deterministic: adding a marker to an older item on a later round would mutate
+ * the serialized prefix and defeat the cache. GPT-5.6 implicit mode writes the
+ * latest implicit checkpoint plus up to the latest three explicit checkpoints.
  */
-function addRollingPromptCacheBreakpoints(messages: ResponseInput, maxBreakpoints: number): void {
-	if (maxBreakpoints <= 0) return;
-	const candidates: CacheableResponseInputText[] = [];
-	const lastItem = messages.at(-1);
-
+function addConversationPromptCacheBreakpoints(messages: ResponseInput): void {
 	for (const item of messages) {
 		if (!("role" in item) || item.role !== "user" || !Array.isArray(item.content)) continue;
-		for (const content of item.content) {
-			if (content.type === "input_text") candidates.push(content as CacheableResponseInputText);
+		const content = item.content.at(-1);
+		if (content) {
+			(content as CacheableResponseInputContent).prompt_cache_breakpoint = { mode: "explicit" };
 		}
-	}
-
-	// The implicit breakpoint already covers a latest user message. When the
-	// request ends in a tool result, its preceding user message remains useful.
-	if (lastItem && "role" in lastItem && lastItem.role === "user") candidates.pop();
-	for (const content of candidates.slice(-maxBreakpoints)) {
-		content.prompt_cache_breakpoint = { mode: "explicit" };
 	}
 }
 

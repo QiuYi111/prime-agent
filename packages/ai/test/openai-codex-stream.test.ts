@@ -468,7 +468,31 @@ describe("openai-codex streaming", () => {
 			systemPrompt: "fixed system, tools, and skills\n\n# Continual Harness State\nmutable refinement",
 			messages: [
 				{ role: "user", content: "round one", timestamp: 1 },
-				{ role: "user", content: "round two", timestamp: 2 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_cache|fc_cache", name: "cad.inspect", arguments: {} }],
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					model: "gpt-5.6-sol",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_cache|fc_cache",
+					toolName: "cad.inspect",
+					content: [{ type: "text", text: "11135" }],
+					isError: false,
+					timestamp: 3,
+				},
 				{ role: "user", content: "latest", timestamp: 3 },
 			],
 		};
@@ -478,7 +502,29 @@ describe("openai-codex streaming", () => {
 			sessionId,
 			transport: "sse",
 		}).result();
-		await streamOpenAICodexResponses(model, context, { apiKey: token, sessionId, transport: "sse" }).result();
+		const extendedContext: Context = {
+			...context,
+			messages: [...context.messages, { role: "user", content: "next round", timestamp: 4 }],
+		};
+		const second = await streamOpenAICodexResponses(model, extendedContext, {
+			apiKey: token,
+			sessionId,
+			transport: "sse",
+		}).result();
+		const toolsChanged = await streamOpenAICodexResponses(
+			model,
+			{
+				...extendedContext,
+				tools: [
+					{
+						name: "new_tool",
+						description: "A tool introduced during the session",
+						parameters: { type: "object", properties: {} } as any,
+					},
+				],
+			},
+			{ apiKey: token, sessionId, transport: "sse" },
+		).result();
 
 		expect(requestBodies[0].prompt_cache_key).toBe(sessionId);
 		expect(requestBodies[0].instructions).toBeUndefined();
@@ -487,14 +533,27 @@ describe("openai-codex streaming", () => {
 		const breakpoints = requestBodies[0].input
 			.flatMap((item: any) => (Array.isArray(item.content) ? item.content : []))
 			.filter((content: any) => content.prompt_cache_breakpoint);
-		expect(breakpoints).toHaveLength(3);
+		expect(breakpoints).toHaveLength(4);
 		expect(requestBodies[0].input[0].content).toHaveLength(2);
 		expect(requestBodies[0].input[0].content[0].text).toBe("fixed system, tools, and skills\n\n");
-		expect(requestBodies[0].input.at(-1).content[0].prompt_cache_breakpoint).toBeUndefined();
+		expect(requestBodies[0].input.at(-1).content[0].prompt_cache_breakpoint).toEqual({ mode: "explicit" });
+		const toolResult = requestBodies[0].input.find((item: any) => item.type === "function_call_output");
+		expect(toolResult.output.at(-1).prompt_cache_breakpoint).toEqual({ mode: "explicit" });
+		expect(requestBodies[1].input.slice(0, requestBodies[0].input.length)).toEqual(requestBodies[0].input);
 		expect(first.usage).toMatchObject({ input: 50, cacheRead: 20, cacheWrite: 30, totalTokens: 105 });
 		expect(first.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache")?.details).toEqual({
 			promptCacheDiagnostics: { status: "miss", reusable_tokens: 80 },
 		});
+		expect(
+			second.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache_request")?.details,
+		).toMatchObject({
+			changedComponent: "append_only",
+			firstDifferentInputItem: null,
+			previousInputIsPrefix: true,
+		});
+		expect(
+			toolsChanged.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache_request")?.details,
+		).toMatchObject({ changedComponent: "tools" });
 	});
 
 	it("preserves gpt-5.5 xhigh reasoning effort from simple options", async () => {
@@ -1088,11 +1147,31 @@ describe("openai-codex streaming", () => {
 					},
 				],
 			},
-			{ role: "user", content: [{ type: "input_text", text: "Say hello" }] },
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "Say hello",
+						prompt_cache_breakpoint: { mode: "explicit" },
+					},
+				],
+			},
 		]);
 		expect(secondBody.store).toBe(false);
 		expect(secondBody.previous_response_id).toBe("resp_1");
-		expect(secondBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
+		expect(secondBody.input).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "Now finish",
+						prompt_cache_breakpoint: { mode: "explicit" },
+					},
+				],
+			},
+		]);
 		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
 			requests: 2,
 			connectionsCreated: 1,
