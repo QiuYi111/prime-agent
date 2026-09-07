@@ -409,7 +409,7 @@ describe("openai-codex streaming", () => {
 		await streamResult.result();
 	});
 
-	it("uses GPT-5.6 explicit checkpoints, comparison diagnostics, and cache write usage", async () => {
+	it("uses a stable GPT-5.6 cache key without fields rejected by the Codex backend", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-cache-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 		const token = mockToken();
@@ -527,18 +527,14 @@ describe("openai-codex streaming", () => {
 		).result();
 
 		expect(requestBodies[0].prompt_cache_key).toBe(sessionId);
-		expect(requestBodies[0].instructions).toBeUndefined();
-		expect(requestBodies[0].prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" });
-		expect(requestBodies[1].prompt_cache_options.comparison_response_id).toBe("resp_cache_1");
+		expect(requestBodies[0].instructions).toBe(context.systemPrompt);
+		expect(requestBodies[0].prompt_cache_options).toBeUndefined();
 		const breakpoints = requestBodies[0].input
 			.flatMap((item: any) => (Array.isArray(item.content) ? item.content : []))
 			.filter((content: any) => content.prompt_cache_breakpoint);
-		expect(breakpoints).toHaveLength(4);
-		expect(requestBodies[0].input[0].content).toHaveLength(2);
-		expect(requestBodies[0].input[0].content[0].text).toBe("fixed system, tools, and skills\n\n");
-		expect(requestBodies[0].input.at(-1).content[0].prompt_cache_breakpoint).toEqual({ mode: "explicit" });
+		expect(breakpoints).toHaveLength(0);
 		const toolResult = requestBodies[0].input.find((item: any) => item.type === "function_call_output");
-		expect(toolResult.output.at(-1).prompt_cache_breakpoint).toEqual({ mode: "explicit" });
+		expect(toolResult.output).toBe("11135");
 		expect(requestBodies[1].input.slice(0, requestBodies[0].input.length)).toEqual(requestBodies[0].input);
 		expect(first.usage).toMatchObject({ input: 50, cacheRead: 20, cacheWrite: 30, totalTokens: 105 });
 		expect(first.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache")?.details).toEqual({
@@ -1006,7 +1002,7 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
-	it("sends only response input deltas with GPT-5.6 cache diagnostics enabled", async () => {
+	it("sends only response input deltas over a cached GPT-5.6 websocket", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];
 		const responses = [
@@ -1139,13 +1135,7 @@ describe("openai-codex streaming", () => {
 		expect(firstBody.input).toEqual([
 			{
 				role: "developer",
-				content: [
-					{
-						type: "input_text",
-						text: "You are a helpful assistant.",
-						prompt_cache_breakpoint: { mode: "explicit" },
-					},
-				],
+				content: "You are a helpful assistant.",
 			},
 			{
 				role: "user",
@@ -1153,7 +1143,6 @@ describe("openai-codex streaming", () => {
 					{
 						type: "input_text",
 						text: "Say hello",
-						prompt_cache_breakpoint: { mode: "explicit" },
 					},
 				],
 			},
@@ -1167,7 +1156,6 @@ describe("openai-codex streaming", () => {
 					{
 						type: "input_text",
 						text: "Now finish",
-						prompt_cache_breakpoint: { mode: "explicit" },
 					},
 				],
 			},

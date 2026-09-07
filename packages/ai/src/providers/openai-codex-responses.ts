@@ -191,7 +191,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					if (options?.signal?.aborted) {
 						throw new Error("Request was aborted");
 					}
-					rememberPromptCacheRequest(options?.sessionId, body, output.responseId);
+					rememberPromptCacheRequest(options?.sessionId, body);
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -289,7 +289,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			rememberPromptCacheRequest(options?.sessionId, body, output.responseId);
+			rememberPromptCacheRequest(options?.sessionId, body);
 
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -333,33 +333,18 @@ function buildRequestBody(
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): RequestBody {
-	const usesGpt56PromptCaching = isGpt56OrLater(model.id) && options?.cacheRetention !== "none";
 	const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
-	const promptContext = usesGpt56PromptCaching
-		? { ...context, systemPrompt: context.systemPrompt || "You are a helpful assistant." }
-		: context;
-	const messages = convertResponsesMessages(model, promptContext, CODEX_TOOL_CALL_PROVIDERS, {
-		includeSystemPrompt: usesGpt56PromptCaching,
-		promptCacheBreakpoints: usesGpt56PromptCaching,
-	});
-	const comparisonResponseId = cacheSessionId ? promptCacheComparisonResponseIds.get(cacheSessionId) : undefined;
+	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS);
 
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
 		stream: true,
-		instructions: usesGpt56PromptCaching ? undefined : context.systemPrompt || "You are a helpful assistant.",
+		instructions: context.systemPrompt || "You are a helpful assistant.",
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: cacheSessionId,
-		prompt_cache_options: usesGpt56PromptCaching
-			? {
-					mode: "implicit",
-					ttl: "30m",
-					...(comparisonResponseId ? { comparison_response_id: comparisonResponseId } : {}),
-				}
-			: undefined,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};
@@ -634,7 +619,6 @@ export interface OpenAICodexWebSocketDebugStats {
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
-const promptCacheComparisonResponseIds = new Map<string, string>();
 const promptCacheRequestSnapshots = new Map<string, PromptCacheRequestSnapshot>();
 
 interface PromptCacheRequestSnapshot {
@@ -707,13 +691,8 @@ function buildPromptCacheRequestDiagnostic(
 	};
 }
 
-function rememberPromptCacheRequest(
-	sessionId: string | undefined,
-	body: RequestBody,
-	responseId: string | undefined,
-): void {
+function rememberPromptCacheRequest(sessionId: string | undefined, body: RequestBody): void {
 	if (sessionId) promptCacheRequestSnapshots.set(sessionId, buildPromptCacheRequestSnapshot(body));
-	if (sessionId && responseId) promptCacheComparisonResponseIds.set(sessionId, responseId);
 }
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
@@ -760,7 +739,6 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		const entry = websocketSessionCache.get(sessionId);
 		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
-		promptCacheComparisonResponseIds.delete(sessionId);
 		promptCacheRequestSnapshots.delete(sessionId);
 		return;
 	}
@@ -768,7 +746,6 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
-	promptCacheComparisonResponseIds.clear();
 	promptCacheRequestSnapshots.clear();
 }
 
