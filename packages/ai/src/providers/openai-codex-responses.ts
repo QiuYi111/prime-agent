@@ -214,7 +214,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
 						}),
 					);
-					recordWebSocketFailure(options?.sessionId, error);
+					recordWebSocketFailure(options?.sessionId, error, !websocketStarted);
 					if (websocketStarted) {
 						throw error;
 					}
@@ -762,14 +762,18 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown, activateFallback: boolean): void {
 	if (!sessionId) return;
-	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
 	stats.lastWebSocketError = formatThrownValue(error);
-	stats.websocketFallbackActive = true;
+	// A mid-stream 1006 can be a transient network drop. Retry with a fresh
+	// WebSocket on the next turn, then pin the session to SSE if it repeats.
+	if (activateFallback || stats.websocketFailures >= 2) {
+		websocketSseFallbackSessions.add(sessionId);
+	}
+	stats.websocketFallbackActive = websocketSseFallbackSessions.has(sessionId);
 }
 
 type WebSocketConstructor = new (
