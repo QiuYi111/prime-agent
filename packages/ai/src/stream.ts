@@ -61,6 +61,20 @@ function failedMessage<TApi extends Api>(model: Model<TApi>, errorMessage: strin
 const REASONING_LIMIT_SETTLE_GRACE_MS = 500;
 
 /**
+ * Events that prove the model left the thinking phase: either the thinking
+ * block was closed explicitly, or text / tool output began. Any of them ends
+ * the phase, so a provider that goes quiet afterwards is not mistaken for
+ * runaway reasoning.
+ */
+const THINKING_PHASE_END_EVENTS = new Set<AssistantMessageEvent["type"]>([
+	"thinking_end",
+	"text_start",
+	"text_delta",
+	"toolcall_start",
+	"toolcall_delta",
+]);
+
+/**
  * Enforce the local thinking budget around one provider stream.
  *
  * Providers whose request format is a plain thinking switch cannot honour the
@@ -73,6 +87,11 @@ const REASONING_LIMIT_SETTLE_GRACE_MS = 500;
  * partial message the provider already produced is kept. The stop reason
  * becomes `reasoning_limit`, and usage that was never reported is marked
  * unavailable instead of being recorded as a real zero.
+ *
+ * A caller abort outranks the deadline: whoever asked to stop first owns the
+ * terminal reason, so the deadline is disarmed as soon as the upstream signal
+ * aborts and a slow provider that only answers back afterwards still settles as
+ * `aborted`.
  */
 function withReasoningLimits<TApi extends Api>(
 	model: Model<TApi>,
@@ -84,20 +103,6 @@ function withReasoningLimits<TApi extends Api>(
 
 	const controller = new AbortController();
 	const upstreamSignal = options?.signal;
-	// Named so it can be removed when the stream settles: one agent run reuses
-	// the same signal for many model calls, and anonymous listeners would pile
-	// up until Node starts warning about a leak.
-	const forwardAbort = (): void => {
-		controller.abort();
-	};
-	if (upstreamSignal) {
-		if (upstreamSignal.aborted) {
-			controller.abort();
-		} else {
-			upstreamSignal.addEventListener("abort", forwardAbort, { once: true });
-		}
-	}
-
 	const guard = new ReasoningRunawayGuard(resolved.limits);
 	const inner = run({ ...(options ?? {}), signal: controller.signal } as StreamOptions);
 	const stream = new AssistantMessageEventStream();
@@ -105,6 +110,8 @@ function withReasoningLimits<TApi extends Api>(
 	/** Newest partial the provider reported, kept for the abort and error paths. */
 	let partial: AssistantMessage | undefined;
 	let settled = false;
+	/** Set when the caller's own signal aborted; that decision beats the deadline. */
+	let upstreamAborted = false;
 	/** Deadline for the open thinking phase, so a silent provider still stops. */
 	let phaseTimer: ReturnType<typeof setTimeout> | undefined;
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -129,10 +136,42 @@ function withReasoningLimits<TApi extends Api>(
 		detachUpstreamAbort();
 	};
 
+	// Named so it can be removed when the stream settles: one agent run reuses
+	// the same signal for many model calls, and anonymous listeners would pile
+	// up until Node starts warning about a leak.
+	const forwardAbort = (): void => {
+		// The caller stopped the turn. Record that before anything else so the
+		// deadline cannot fire while the provider unwinds and rewrite the turn
+		// as a reasoning limit, and drop the pending deadline here rather than
+		// waiting for the provider to come back.
+		upstreamAborted = true;
+		clearTimers();
+		controller.abort();
+	};
+	if (upstreamSignal) {
+		if (upstreamSignal.aborted) {
+			upstreamAborted = true;
+			controller.abort();
+		} else {
+			upstreamSignal.addEventListener("abort", forwardAbort, { once: true });
+		}
+	}
+
 	const settle = (message: AssistantMessage): void => {
 		if (settled) return;
 		settled = true;
 		cleanup();
+		if (upstreamAborted) {
+			// The caller aborted while the provider was still unwinding, so the
+			// provider never labelled its own message. Keep what it streamed and
+			// report the abort instead of a success or a reasoning limit.
+			message.stopReason = "aborted";
+			message.reasoningLimit = undefined;
+			markUsageUnavailable(message, "aborted");
+			stream.push({ type: "error", reason: "aborted", error: message });
+			stream.end(message);
+			return;
+		}
 		if (trip || message.stopReason === "reasoning_limit") {
 			const details = trip ?? message.reasoningLimit;
 			message.stopReason = "reasoning_limit";
@@ -163,6 +202,7 @@ function withReasoningLimits<TApi extends Api>(
 
 	/** Stop the provider stream and give it a bounded moment to report its own final message. */
 	const abortForLimit = (details: ReasoningLimitDetails): void => {
+		if (upstreamAborted) return;
 		trip = details;
 		clearTimers();
 		detachUpstreamAbort();
@@ -175,7 +215,7 @@ function withReasoningLimits<TApi extends Api>(
 
 	function onPhaseDeadline(): void {
 		phaseTimer = undefined;
-		if (settled || trip) return;
+		if (settled || trip || upstreamAborted) return;
 		const details = guard.check();
 		if (details) {
 			abortForLimit(details);
@@ -186,6 +226,7 @@ function withReasoningLimits<TApi extends Api>(
 	}
 
 	function armPhaseDeadline(): void {
+		if (upstreamAborted) return;
 		const remaining = guard.remainingMs;
 		if (remaining === undefined || phaseTimer !== undefined) return;
 		phaseTimer = setTimeout(onPhaseDeadline, Math.max(1, remaining));
@@ -208,22 +249,19 @@ function withReasoningLimits<TApi extends Api>(
 				// stop delivering further deltas so callers never see thinking
 				// beyond the limit.
 				if (trip) continue;
-				if (event.type === "thinking_start" || event.type === "thinking_delta") {
-					const thinking = guard.isThinking;
-					const details = guard.observeThinking(event.type === "thinking_delta" ? event.delta.length : 0);
-					if (details) {
-						abortForLimit(details);
-					} else if (!thinking) {
-						armPhaseDeadline();
+				if (!upstreamAborted) {
+					if (event.type === "thinking_start" || event.type === "thinking_delta") {
+						const thinking = guard.isThinking;
+						const details = guard.observeThinking(event.type === "thinking_delta" ? event.delta.length : 0);
+						if (details) {
+							abortForLimit(details);
+						} else if (!thinking) {
+							armPhaseDeadline();
+						}
+					} else if (THINKING_PHASE_END_EVENTS.has(event.type)) {
+						guard.reset();
+						clearTimers();
 					}
-				} else if (
-					event.type === "text_start" ||
-					event.type === "text_delta" ||
-					event.type === "toolcall_start" ||
-					event.type === "toolcall_delta"
-				) {
-					guard.reset();
-					clearTimers();
 				}
 				stream.push(event);
 			}

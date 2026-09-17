@@ -279,6 +279,152 @@ function registerLateOutputProvider(options: { phase: "text" | "toolcall"; silen
 }
 
 /**
+ * Provider that closes its thinking block and only then goes quiet: it reports
+ * `thinking_start`, deltas and `thinking_end`, then stalls past the time budget
+ * before the next block starts. The thinking phase is over, so the deadline
+ * must not fire during that silence.
+ */
+function registerEndedThinkingProvider(options: { silenceMs: number }) {
+	const api = "test-ended-thinking";
+	const sourceId = "res-283-ended-thinking-provider";
+	const chunk = "t".repeat(200);
+	const state = { abortedAfterThinkingEnd: false };
+	const model: Model<string> = {
+		id: "ended-thinking",
+		name: "Ended Thinking",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (let index = 0; index < 2; index++) {
+				await sleep(1);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			yield { type: "thinking_end", contentIndex: 0, content: thinking.thinking, partial };
+
+			// The thinking block is closed; the next block has not started yet.
+			await sleep(options.silenceMs);
+			state.abortedAfterThinkingEnd = streamOptions?.signal?.aborted ?? false;
+
+			const text: TextContent = { type: "text", text: "" };
+			partial.content = [thinking, text];
+			yield { type: "text_start", contentIndex: 1, partial };
+			text.text = "design ready";
+			yield { type: "text_delta", contentIndex: 1, delta: text.text, partial };
+			yield { type: "text_end", contentIndex: 1, content: text.text, partial };
+			yield { type: "done", reason: "stop", message: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
+ * Provider that is slow to unwind a caller abort: it thinks until the caller
+ * stops the turn, then only answers back after a delay long enough to cross the
+ * reasoning deadline. `report` picks the two ways that answer arrives, a
+ * terminal event that already says `aborted`, or a throw while unwinding.
+ */
+function registerSlowAbortProvider(options: { unwindMs: number; report: "aborted" | "throw" }) {
+	const api = `test-slow-abort-${options.report}`;
+	const sourceId = `res-283-slow-abort-${options.report}-provider`;
+	const chunk = "t".repeat(200);
+	const state = { unwound: false };
+	const model: Model<string> = {
+		id: `slow-abort-${options.report}`,
+		name: `Slow Abort ${options.report}`,
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (let index = 0; index < 3; index++) {
+				await sleep(10);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			await new Promise<void>((resolve) => {
+				if (streamOptions?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				streamOptions?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			await sleep(options.unwindMs);
+			state.unwound = true;
+			if (options.report === "throw") throw new Error("Request was aborted");
+			partial.stopReason = "aborted";
+			partial.errorMessage = "Request was aborted";
+			yield { type: "error", reason: "aborted", error: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
  * Provider that ends its own stream with the `reasoning_limit` stop reason, the
  * way an inner guard would, without this wrapper's own budget tripping.
  */
@@ -530,6 +676,54 @@ describe("reasoning runaway guard", () => {
 		}
 
 		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+	});
+
+	it("does not trip the deadline after an explicit thinking_end", async () => {
+		const provider = registerEndedThinkingProvider({ silenceMs: 300 });
+		try {
+			const { message } = await collect(
+				stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingMs: 100 } }),
+			);
+
+			// The thinking block was closed, so the silence before the next block
+			// is not runaway reasoning and the deadline must be disarmed.
+			expect(provider.state.abortedAfterThinkingEnd).toBe(false);
+			expect(message.stopReason).toBe("stop");
+			expect(message.reasoningLimit).toBeUndefined();
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("keeps a caller abort that lands before the reasoning deadline", async () => {
+		for (const report of ["aborted", "throw"] as const) {
+			const provider = registerSlowAbortProvider({ unwindMs: 300, report });
+			try {
+				const controller = new AbortController();
+				const streamResult = stream(provider.model, context, {
+					apiKey: "test",
+					reasoningLimits: { maxThinkingMs: 100 },
+					signal: controller.signal,
+				});
+
+				// The caller stops the turn while the model is still thinking, then
+				// the provider only answers back well after the deadline passed.
+				let thinkingDeltas = 0;
+				for await (const event of streamResult) {
+					if (event.type === "thinking_delta" && ++thinkingDeltas === 3) controller.abort();
+				}
+				const message = await streamResult.result();
+
+				expect(provider.state.unwound).toBe(true);
+				// The abort came first, so it owns the terminal reason.
+				expect(message.stopReason).toBe("aborted");
+				expect(message.reasoningLimit).toBeUndefined();
+				expect(thinkingOf(message).length).toBeGreaterThan(0);
+				expect(message.usageUnavailable).toBe("aborted");
+			} finally {
+				provider.unregister();
+			}
+		}
 	});
 
 	it("removes its upstream abort listener after the guard trips", async () => {
