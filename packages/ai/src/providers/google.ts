@@ -19,7 +19,7 @@ import type {
 	ThinkingLevel,
 	ToolCall,
 } from "../types.js";
-import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { AssistantMessageEventStream, terminalAssistantEvent } from "../utils/event-stream.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	formatStreamFailureMessage,
@@ -262,7 +262,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 				throw streamFailureFromStopReason(output.stopReasonRaw);
 			}
 
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.push(terminalAssistantEvent(output));
 			stream.end();
 		} catch (error) {
 			// Remove internal index property used during streaming

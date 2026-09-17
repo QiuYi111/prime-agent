@@ -31,7 +31,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
-import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { AssistantMessageEventStream, terminalAssistantEvent } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
@@ -399,7 +399,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");
 			}
 
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.push(terminalAssistantEvent(output));
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {

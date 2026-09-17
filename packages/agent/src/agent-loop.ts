@@ -340,7 +340,11 @@ async function runLoop(
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+			if (
+				message.stopReason === "error" ||
+				message.stopReason === "aborted" ||
+				message.stopReason === "reasoning_limit"
+			) {
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;

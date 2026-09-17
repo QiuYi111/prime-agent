@@ -15,7 +15,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types.js";
-import { createAssistantMessageEventStream } from "../utils/event-stream.js";
+import { createAssistantMessageEventStream, terminalAssistantEvent } from "../utils/event-stream.js";
 
 const DEFAULT_API = "faux";
 const DEFAULT_PROVIDER = "faux";
@@ -378,13 +378,7 @@ async function streamWithDeltas(
 		stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: { ...partial } });
 	}
 
-	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		stream.push({ type: "error", reason: message.stopReason, error: message });
-		stream.end(message);
-		return;
-	}
-
-	stream.push({ type: "done", reason: message.stopReason, message });
+	stream.push(terminalAssistantEvent(message));
 	stream.end(message);
 }
 

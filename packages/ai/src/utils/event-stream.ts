@@ -82,3 +82,15 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 export function createAssistantMessageEventStream(): AssistantMessageEventStream {
 	return new AssistantMessageEventStream();
 }
+
+/**
+ * Terminal event for a finished assistant message. `done` only carries
+ * non-failure reasons, so `error`, `aborted` and `reasoning_limit` are reported
+ * through the `error` variant instead of being flattened into a `done`.
+ */
+export function terminalAssistantEvent(message: AssistantMessage): AssistantMessageEvent {
+	if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "reasoning_limit") {
+		return { type: "error", reason: message.stopReason, error: message };
+	}
+	return { type: "done", reason: message.stopReason, message };
+}

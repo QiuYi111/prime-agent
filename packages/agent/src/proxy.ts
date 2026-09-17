@@ -41,7 +41,7 @@ export type ProxyAssistantMessageEvent =
 	  }
 	| {
 			type: "error";
-			reason: Extract<StopReason, "aborted" | "error">;
+			reason: Extract<StopReason, "aborted" | "error" | "reasoning_limit">;
 			errorMessage?: string;
 			usage: AssistantMessage["usage"];
 	  };

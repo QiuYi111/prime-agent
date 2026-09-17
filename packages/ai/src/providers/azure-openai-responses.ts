@@ -11,7 +11,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 } from "../types.js";
-import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { AssistantMessageEventStream, terminalAssistantEvent } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import {
 	formatStreamFailureMessage,
@@ -110,7 +110,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				throw streamFailureFromStopReason(output.stopReasonRaw, { requestId });
 			}
 
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.push(terminalAssistantEvent(output));
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
