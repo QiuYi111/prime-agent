@@ -38,6 +38,18 @@ export type ReasoningCapability =
 	/** Provider only switches thinking on or off; the kernel supplies the budget. */
 	| { kind: "local"; levelLimits: Record<ThinkingLevel, ReasoningLimits> };
 
+/** Characters per estimated token, used because no tokenizer is available here. */
+const ESTIMATED_CHARS_PER_TOKEN = 4;
+
+/**
+ * How much of one thinking delta may reach the caller, and the limit that delta
+ * ran into, if any.
+ */
+export interface ThinkingDeltaBudget {
+	deliverableChars: number;
+	details?: ReasoningLimitDetails;
+}
+
 function openAICompat(model: Model<Api>): OpenAICompletionsCompat | undefined {
 	return (model as { compat?: OpenAICompletionsCompat }).compat;
 }
@@ -142,6 +154,9 @@ export function resolveReasoningLimits<TApi extends Api>(
  * Tracks one uninterrupted thinking phase. Reaching text or tool output ends
  * the phase and resets the counters, so a model that thinks a little, acts,
  * and thinks again is not punished for its total thinking across a turn.
+ *
+ * The counters only hold the thinking the caller was allowed to see: see
+ * `observeThinkingDelta`.
  */
 export class ReasoningRunawayGuard {
 	private thinkingChars = 0;
@@ -152,8 +167,36 @@ export class ReasoningRunawayGuard {
 		private readonly now: () => number = Date.now,
 	) {}
 
-	/** Call for every thinking delta. Returns the tripped limit, if any. */
-	observeThinking(deltaLength: number): ReasoningLimitDetails | undefined {
+	/**
+	 * Observe one thinking delta and clip it to the budget that is still open.
+	 *
+	 * `deliverableChars` is how much of the delta may reach the caller. A delta
+	 * that would push the phase past a character or estimated-token cap is
+	 * clipped to the characters that still fit, so the thinking callers receive
+	 * never crosses a configured cap; `details.observed` reports that clipped
+	 * total rather than whatever the provider tried to send.
+	 */
+	observeThinkingDelta(deltaLength: number): ThinkingDeltaBudget {
+		const remaining = this.remainingChars;
+		const deliverableChars = remaining === undefined ? deltaLength : Math.min(deltaLength, remaining);
+		return { deliverableChars, details: this.observe(deliverableChars) };
+	}
+
+	/**
+	 * Characters of thinking the caller may still receive before the character
+	 * or estimated-token cap is reached. `undefined` when neither cap applies.
+	 */
+	get remainingChars(): number | undefined {
+		const caps: number[] = [];
+		if (this.limits.maxThinkingChars !== undefined) caps.push(this.limits.maxThinkingChars);
+		if (this.limits.maxThinkingTokens !== undefined) {
+			caps.push(this.limits.maxThinkingTokens * ESTIMATED_CHARS_PER_TOKEN);
+		}
+		if (caps.length === 0) return undefined;
+		return Math.max(0, Math.min(...caps) - this.thinkingChars);
+	}
+
+	private observe(deltaLength: number): ReasoningLimitDetails | undefined {
 		const at = this.now();
 		if (this.thinkingStartedAt === null) this.thinkingStartedAt = at;
 		if (deltaLength > 0) this.thinkingChars += deltaLength;
@@ -193,7 +236,7 @@ export class ReasoningRunawayGuard {
 	}
 
 	get observedTokens(): number {
-		return Math.ceil(this.thinkingChars / 4);
+		return Math.ceil(this.thinkingChars / ESTIMATED_CHARS_PER_TOKEN);
 	}
 
 	get observedMs(): number {

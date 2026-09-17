@@ -123,6 +123,16 @@ function thinkingOf(message: AssistantMessage): string {
 		.join("");
 }
 
+/** Thinking characters that actually reached the caller through the events. */
+function deliveredThinking(events: AssistantMessageEvent[]): string {
+	return events
+		.filter((event): event is Extract<AssistantMessageEvent, { type: "thinking_delta" }> => {
+			return event.type === "thinking_delta";
+		})
+		.map((event) => event.delta)
+		.join("");
+}
+
 function textOf(message: AssistantMessage): string {
 	return message.content
 		.filter((block): block is TextContent => block.type === "text")
@@ -687,6 +697,76 @@ function registerFailingProvider(options: { outcome: "throw" | "eof" }) {
 	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
 }
 
+/**
+ * Provider that streams caller-supplied thinking chunks and then waits for the
+ * abort. The chunks do not have to divide the budget: one of them can cross the
+ * limit, so the wrapper has to decide what part of it reaches the caller. Once
+ * aborted, `report` picks how the provider answers: with its own partial as a
+ * terminal event (the untrimmed text is still in there), or by throwing while
+ * unwinding.
+ */
+function registerChunkedThinkingProvider(options: { chunks: string[]; report: "terminal" | "throw" }) {
+	const api = `test-chunked-thinking-${options.report}`;
+	const sourceId = `res-283-chunked-thinking-${options.report}-provider`;
+	const model: Model<string> = {
+		id: `chunked-thinking-${options.report}`,
+		name: `Chunked Thinking ${options.report}`,
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (const chunk of options.chunks) {
+				await new Promise((resolve) => setTimeout(resolve, 1));
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			await new Promise<void>((resolve) => {
+				if (streamOptions?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				streamOptions?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			if (options.report === "throw") throw new Error("Request was aborted");
+			partial.stopReason = "aborted";
+			partial.errorMessage = "Request was aborted";
+			yield { type: "error", reason: "aborted", error: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, unregister: () => unregisterApiProviders(sourceId) };
+}
+
 beforeEach(() => {
 	mockState.lastParams = undefined;
 	mockState.lastSignal = undefined;
@@ -847,6 +927,55 @@ describe("reasoning runaway guard", () => {
 			expect(thinkingOf(message)).toBe("t".repeat(2_000));
 			expect(message.usage.totalTokens).toBe(0);
 			expect(message.usageUnavailable).toBe("reasoning_limit");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("does not deliver thinking past the character budget", async () => {
+		for (const report of ["terminal", "throw"] as const) {
+			const provider = registerChunkedThinkingProvider({
+				chunks: ["t".repeat(900), "t".repeat(500)],
+				report,
+			});
+			try {
+				const { events, message } = await collect(
+					stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingChars: 1_000 } }),
+				);
+
+				// 900 + 500 crosses the 1000 character budget, so only the first
+				// 100 characters of the second delta may reach the caller, and the
+				// partial the provider hands back may not restore the rest.
+				expect(deliveredThinking(events)).toBe("t".repeat(1_000));
+				expect(thinkingOf(message)).toBe("t".repeat(1_000));
+				expect(message.stopReason).toBe("reasoning_limit");
+				expect(message.reasoningLimit).toEqual({
+					reason: "max_thinking_chars",
+					limit: 1_000,
+					observed: 1_000,
+				});
+				expect(message.usageUnavailable).toBe("reasoning_limit");
+			} finally {
+				provider.unregister();
+			}
+		}
+	});
+
+	it("clips a single thinking delta that is larger than the whole budget", async () => {
+		const provider = registerChunkedThinkingProvider({ chunks: ["t".repeat(5_000)], report: "terminal" });
+		try {
+			const { events, message } = await collect(
+				stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingChars: 1_000 } }),
+			);
+
+			expect(deliveredThinking(events)).toBe("t".repeat(1_000));
+			expect(thinkingOf(message)).toBe("t".repeat(1_000));
+			expect(message.stopReason).toBe("reasoning_limit");
+			expect(message.reasoningLimit).toEqual({
+				reason: "max_thinking_chars",
+				limit: 1_000,
+				observed: 1_000,
+			});
 		} finally {
 			provider.unregister();
 		}
@@ -1070,13 +1199,18 @@ describe("reasoning runaway guard", () => {
 	it("does not trip while the model interleaves thinking with output", async () => {
 		const guard = new ReasoningRunawayGuard({ maxThinkingChars: 1_000 });
 
-		expect(guard.observeThinking(900)).toBeUndefined();
+		expect(guard.observeThinkingDelta(900)).toEqual({ deliverableChars: 900, details: undefined });
 		guard.reset();
-		expect(guard.observeThinking(900)).toBeUndefined();
-		expect(guard.observeThinking(200)).toEqual({
-			reason: "max_thinking_chars",
-			limit: 1_000,
-			observed: 1_100,
+		expect(guard.observeThinkingDelta(900)).toEqual({ deliverableChars: 900, details: undefined });
+		// The delta that crosses the cap is clipped to what still fits, and the
+		// reported observation is the clipped total.
+		expect(guard.observeThinkingDelta(200)).toEqual({
+			deliverableChars: 100,
+			details: {
+				reason: "max_thinking_chars",
+				limit: 1_000,
+				observed: 1_000,
+			},
 		});
 	});
 

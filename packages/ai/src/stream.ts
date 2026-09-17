@@ -82,18 +82,34 @@ const THINKING_PHASE_END_EVENTS = new Set<AssistantMessageEvent["type"]>([
 const FAILURE_STOP_REASONS = new Set<AssistantMessage["stopReason"]>(["error", "aborted", "reasoning_limit"]);
 
 /**
+ * Drop the over-budget tail of one thinking delta out of the provider's
+ * partial, so the message handed to the caller holds exactly the thinking that
+ * was delivered. The provider keeps mutating this object - later chunks carry
+ * its usage - so the block is edited in place instead of copied.
+ */
+function dropThinkingTail(message: AssistantMessage, contentIndex: number, droppedChars: number): AssistantMessage {
+	const block = message.content[contentIndex];
+	if (droppedChars > 0 && block?.type === "thinking") {
+		block.thinking = block.thinking.slice(0, Math.max(0, block.thinking.length - droppedChars));
+	}
+	return message;
+}
+
+/**
  * Enforce the local thinking budget around one provider stream.
  *
  * Providers whose request format is a plain thinking switch cannot honour the
  * requested thinking level, so the kernel watches the thinking that arrives
  * without any text or tool output and aborts the provider stream once a
  * configured limit is reached. Character and token limits are checked as
- * deltas arrive, the time limit is a real deadline so a provider that goes
- * quiet mid-thinking is stopped too, and reaching text or a tool call ends the
- * phase so slow output is never mistaken for runaway thinking. Whatever
- * partial message the provider already produced is kept. The stop reason
- * becomes `reasoning_limit`, and usage that was never reported is marked
- * unavailable instead of being recorded as a real zero.
+ * deltas arrive, and the delta that would cross the budget is clipped to the
+ * characters that still fit, so callers never receive thinking beyond the cap.
+ * The time limit is a real deadline so a provider that goes quiet mid-thinking
+ * is stopped too, and reaching text or a tool call ends the phase so slow
+ * output is never mistaken for runaway thinking. Whatever partial message the
+ * provider already produced is kept, trimmed to the same clipped thinking. The
+ * stop reason becomes `reasoning_limit`, and usage that was never reported is
+ * marked unavailable instead of being recorded as a real zero.
  *
  * A caller abort outranks the deadline: whoever asked to stop first owns the
  * terminal reason, so the deadline is disarmed as soon as the upstream signal
@@ -125,6 +141,12 @@ function withReasoningLimits<TApi extends Api>(
 	/** Deadline for the open thinking phase, so a silent provider still stops. */
 	let phaseTimer: ReturnType<typeof setTimeout> | undefined;
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Thinking length the result must keep once a delta was clipped. The
+	 * provider may hand its own untrimmed partial back while it unwinds, and that
+	 * message must not restore the over-budget tail.
+	 */
+	let thinkingTrim: { contentIndex: number; length: number } | undefined;
 
 	const clearTimers = (): void => {
 		if (phaseTimer !== undefined) {
@@ -141,6 +163,12 @@ function withReasoningLimits<TApi extends Api>(
 		if (settled) return;
 		settled = true;
 		cleanup();
+		if (thinkingTrim) {
+			const block = message.content[thinkingTrim.contentIndex];
+			if (block?.type === "thinking" && block.thinking.length > thinkingTrim.length) {
+				block.thinking = block.thinking.slice(0, thinkingTrim.length);
+			}
+		}
 		if (upstreamAborted) {
 			// The caller aborted while the provider was still unwinding, so the
 			// provider never labelled its own message. Keep what it streamed and
@@ -279,24 +307,38 @@ function withReasoningLimits<TApi extends Api>(
 					settle(event.type === "done" ? event.message : event.error);
 					break;
 				}
-				// The newest partial is kept even after the budget is spent: the
-				// provider may have buffered slightly ahead and those blocks are
-				// still what the caller should end up with.
-				partial = event.partial;
-				// Once the budget is spent the stream is already terminating;
-				// stop delivering further deltas so callers never see thinking
-				// beyond the limit.
+				// Once the budget is spent the stream is already terminating, and
+				// the partial is frozen at the clipped message. Dropping the rest
+				// keeps whatever the provider buffered ahead out of the result.
 				if (trip) continue;
+				// The newest partial is kept for the abort and error paths.
+				partial = event.partial;
 				if (!upstreamAborted) {
 					if (event.type === "thinking_start" || event.type === "thinking_delta") {
 						const thinking = guard.isThinking;
-						const details = guard.observeThinking(event.type === "thinking_delta" ? event.delta.length : 0);
-						if (details) {
-							abortForLimit(details);
+						const budget = guard.observeThinkingDelta(event.type === "thinking_delta" ? event.delta.length : 0);
+						if (event.type === "thinking_delta" && budget.deliverableChars < event.delta.length) {
+							// This delta crosses the budget: hand the caller only the
+							// characters that still fit, and clip the partial the same way
+							// so the over-budget tail cannot come back through the result.
+							thinkingTrim = { contentIndex: event.contentIndex, length: guard.observedChars };
+							partial = dropThinkingTail(
+								partial,
+								event.contentIndex,
+								event.delta.length - budget.deliverableChars,
+							);
+							stream.push({ ...event, delta: event.delta.slice(0, budget.deliverableChars), partial });
+						} else {
+							stream.push(event);
+						}
+						if (budget.details) {
+							abortForLimit(budget.details);
 						} else if (!thinking) {
 							armPhaseDeadline();
 						}
-					} else if (THINKING_PHASE_END_EVENTS.has(event.type)) {
+						continue;
+					}
+					if (THINKING_PHASE_END_EVENTS.has(event.type)) {
 						guard.reset();
 						clearTimers();
 					}
