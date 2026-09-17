@@ -1,0 +1,2 @@
+- Added a `reasoning_limit` stop reason with local thinking budgets: providers whose request format is only a thinking switch (z.ai, qwen) can no longer run reasoning for tens of thousands of characters without producing text or a tool call, and the provider stream is aborted once the configured budget is spent.
+- Marked usage as `usageUnavailable` when a stream ends before the provider reported usage, instead of recording a real zero.

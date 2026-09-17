@@ -63,6 +63,46 @@ export interface ThinkingBudgets {
 	high?: number;
 }
 
+/**
+ * Local safety limits for one uninterrupted thinking phase.
+ *
+ * Providers whose wire protocol only has a boolean thinking switch (for
+ * example z.ai's `enable_thinking`) cannot express `minimal`..`max` as a real
+ * provider-side budget. The kernel applies these limits locally so the levels
+ * still mean something and a runaway reasoning loop terminates.
+ *
+ * A limit is measured over the thinking that arrives without any text or tool
+ * output in between; text or tool output resets the counters.
+ */
+export interface ReasoningLimits {
+	/** Abort once this many thinking characters arrived without any text/tool output. */
+	maxThinkingChars?: number;
+	/** Abort once thinking output is estimated to exceed this many tokens (characters / 4). */
+	maxThinkingTokens?: number;
+	/** Abort once one thinking phase lasted longer than this many milliseconds. */
+	maxThinkingMs?: number;
+}
+
+/** Which configured reasoning limit tripped. */
+export type ReasoningLimitReason = "max_thinking_chars" | "max_thinking_tokens" | "max_thinking_ms";
+
+/** Structured detail for a `reasoning_limit` termination. */
+export interface ReasoningLimitDetails {
+	reason: ReasoningLimitReason;
+	/** Configured value that was exceeded. */
+	limit: number;
+	/** Observed value at the moment the limit tripped. */
+	observed: number;
+}
+
+/**
+ * Why a message carries no measured token usage. Numeric `usage` fields are
+ * placeholders in that case, not measurements: a provider that only reports
+ * usage with its final chunk never delivered one because the stream ended
+ * early.
+ */
+export type UsageUnavailableReason = "aborted" | "error" | "reasoning_limit";
+
 // Base options all providers share
 export type CacheRetention = "none" | "short" | "long";
 
@@ -78,6 +118,13 @@ export interface ProviderResponse {
 export interface StreamOptions {
 	temperature?: number;
 	maxTokens?: number;
+	/**
+	 * Local thinking-phase limits for providers without a provider-side
+	 * reasoning budget. Defaults are derived from the model's reasoning
+	 * capability and the requested thinking level; pass `false` to disable the
+	 * local guard for this request.
+	 */
+	reasoningLimits?: ReasoningLimits | false;
 	signal?: AbortSignal;
 	apiKey?: string;
 	/**
@@ -214,7 +261,7 @@ export interface Usage {
 	};
 }
 
-export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted" | "reasoning_limit";
 
 export interface UserMessage {
 	role: "user";
@@ -234,6 +281,14 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	stopReasonRaw?: string; // Provider's raw stop/finish reason when it mapped to "error" (e.g. "refusal", "SAFETY")
+	/** Set when `stopReason` is `reasoning_limit`; says which local limit tripped. */
+	reasoningLimit?: ReasoningLimitDetails;
+	/**
+	 * Set when the provider never reported token usage for this message. The
+	 * numeric `usage` fields are placeholders in that case and must not be
+	 * presented as measured zeros.
+	 */
+	usageUnavailable?: UsageUnavailableReason;
 	errorMessage?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }
@@ -283,8 +338,10 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
-	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
-	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
+	// `done` only carries non-failure reasons; `reasoning_limit` is reported
+	// through the `error` variant below.
+	| { type: "done"; reason: Exclude<StopReason, "error" | "aborted">; message: AssistantMessage }
+	| { type: "error"; reason: Extract<StopReason, "aborted" | "error" | "reasoning_limit">; error: AssistantMessage };
 
 /**
  * Compatibility settings for OpenAI-compatible completions APIs.
@@ -458,6 +515,12 @@ export interface Model<TApi extends Api> {
 	};
 	contextWindow: number;
 	maxTokens: number;
+	/**
+	 * Per-model local thinking-phase limits. Used when the provider has no real
+	 * reasoning budget of its own, and as the default for every request that
+	 * does not pass `StreamOptions.reasoningLimits`.
+	 */
+	reasoningLimits?: ReasoningLimits;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;
 	headers?: Record<string, string>;
