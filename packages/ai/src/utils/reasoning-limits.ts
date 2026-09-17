@@ -139,9 +139,9 @@ export function resolveReasoningLimits<TApi extends Api>(
 }
 
 /**
- * Tracks one uninterrupted thinking phase. Text or tool output resets the
- * counters, so a model that thinks a little, acts, and thinks again is not
- * punished for its total thinking across a turn.
+ * Tracks one uninterrupted thinking phase. Reaching text or tool output ends
+ * the phase and resets the counters, so a model that thinks a little, acts,
+ * and thinks again is not punished for its total thinking across a turn.
  */
 export class ReasoningRunawayGuard {
 	private thinkingChars = 0;
@@ -160,7 +160,7 @@ export class ReasoningRunawayGuard {
 		return this.evaluate(at);
 	}
 
-	/** Call for text or tool output; starts a fresh thinking phase. */
+	/** Call when text or tool output starts or continues; ends the thinking phase. */
 	reset(): void {
 		this.thinkingChars = 0;
 		this.thinkingStartedAt = null;

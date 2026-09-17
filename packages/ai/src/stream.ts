@@ -10,10 +10,9 @@ import type {
 	ProviderStreamOptions,
 	ReasoningLimitDetails,
 	SimpleStreamOptions,
-	StopReason,
 	StreamOptions,
 } from "./types.js";
-import { AssistantMessageEventStream } from "./utils/event-stream.js";
+import { AssistantMessageEventStream, terminalAssistantEvent } from "./utils/event-stream.js";
 import {
 	formatReasoningLimitMessage,
 	type ReasoningLimitOptions,
@@ -69,10 +68,11 @@ const REASONING_LIMIT_SETTLE_GRACE_MS = 500;
  * without any text or tool output and aborts the provider stream once a
  * configured limit is reached. Character and token limits are checked as
  * deltas arrive, the time limit is a real deadline so a provider that goes
- * quiet mid-thinking is stopped too, and whatever partial message the provider
- * already produced is kept. The stop reason becomes `reasoning_limit`, and
- * usage that was never reported is marked unavailable instead of being
- * recorded as a real zero.
+ * quiet mid-thinking is stopped too, and reaching text or a tool call ends the
+ * phase so slow output is never mistaken for runaway thinking. Whatever
+ * partial message the provider already produced is kept. The stop reason
+ * becomes `reasoning_limit`, and usage that was never reported is marked
+ * unavailable instead of being recorded as a real zero.
  */
 function withReasoningLimits<TApi extends Api>(
 	model: Model<TApi>,
@@ -84,11 +84,17 @@ function withReasoningLimits<TApi extends Api>(
 
 	const controller = new AbortController();
 	const upstreamSignal = options?.signal;
+	// Named so it can be removed when the stream settles: one agent run reuses
+	// the same signal for many model calls, and anonymous listeners would pile
+	// up until Node starts warning about a leak.
+	const forwardAbort = (): void => {
+		controller.abort();
+	};
 	if (upstreamSignal) {
 		if (upstreamSignal.aborted) {
 			controller.abort();
 		} else {
-			upstreamSignal.addEventListener("abort", () => controller.abort(), { once: true });
+			upstreamSignal.addEventListener("abort", forwardAbort, { once: true });
 		}
 	}
 
@@ -114,30 +120,36 @@ function withReasoningLimits<TApi extends Api>(
 		}
 	};
 
+	const detachUpstreamAbort = (): void => {
+		upstreamSignal?.removeEventListener("abort", forwardAbort);
+	};
+
+	const cleanup = (): void => {
+		clearTimers();
+		detachUpstreamAbort();
+	};
+
 	const settle = (message: AssistantMessage): void => {
 		if (settled) return;
 		settled = true;
-		clearTimers();
-		if (trip) {
+		cleanup();
+		if (trip || message.stopReason === "reasoning_limit") {
+			const details = trip ?? message.reasoningLimit;
 			message.stopReason = "reasoning_limit";
-			message.reasoningLimit = trip;
-			message.errorMessage = formatReasoningLimitMessage(trip);
+			if (details) {
+				message.reasoningLimit = details;
+				message.errorMessage = formatReasoningLimitMessage(details);
+			} else if (!message.errorMessage) {
+				message.errorMessage = "Reasoning limit reached.";
+			}
 			markUsageUnavailable(message, "reasoning_limit");
 			stream.push({ type: "error", reason: "reasoning_limit", error: message });
 			stream.end(message);
 			return;
 		}
-		if (message.stopReason === "aborted" || message.stopReason === "error") {
-			markUsageUnavailable(message, message.stopReason);
-			stream.push({ type: "error", reason: message.stopReason, error: message });
-			stream.end(message);
-			return;
-		}
-		stream.push({
-			type: "done",
-			reason: message.stopReason as Exclude<StopReason, "error" | "aborted">,
-			message,
-		});
+		const terminal = terminalAssistantEvent(message);
+		if (terminal.type === "error") markUsageUnavailable(message, terminal.reason);
+		stream.push(terminal);
 		stream.end(message);
 	};
 
@@ -153,6 +165,7 @@ function withReasoningLimits<TApi extends Api>(
 	const abortForLimit = (details: ReasoningLimitDetails): void => {
 		trip = details;
 		clearTimers();
+		detachUpstreamAbort();
 		controller.abort();
 		graceTimer = setTimeout(
 			() => settleWithPartial(formatReasoningLimitMessage(details)),
@@ -203,7 +216,12 @@ function withReasoningLimits<TApi extends Api>(
 					} else if (!thinking) {
 						armPhaseDeadline();
 					}
-				} else if (event.type === "text_delta" || event.type === "toolcall_delta") {
+				} else if (
+					event.type === "text_start" ||
+					event.type === "text_delta" ||
+					event.type === "toolcall_start" ||
+					event.type === "toolcall_delta"
+				) {
 					guard.reset();
 					clearTimers();
 				}

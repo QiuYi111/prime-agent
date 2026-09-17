@@ -338,9 +338,13 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
-	// `done` only carries non-failure reasons; `reasoning_limit` is reported
-	// through the `error` variant below.
-	| { type: "done"; reason: Exclude<StopReason, "error" | "aborted">; message: AssistantMessage }
+	// `done` only carries non-failure reasons; `reasoning_limit` is a failure
+	// and is reported through the `error` variant below.
+	| {
+			type: "done";
+			reason: Exclude<StopReason, "error" | "aborted" | "reasoning_limit">;
+			message: AssistantMessage;
+	  }
 	| { type: "error"; reason: Extract<StopReason, "aborted" | "error" | "reasoning_limit">; error: AssistantMessage };
 
 /**

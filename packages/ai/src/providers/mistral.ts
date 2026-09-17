@@ -22,7 +22,7 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types.js";
-import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { AssistantMessageEventStream, terminalAssistantEvent } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
@@ -86,7 +86,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 				throw streamFailureFromStopReason(output.stopReasonRaw);
 			}
 
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.push(terminalAssistantEvent(output));
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {

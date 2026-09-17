@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerApiProvider, unregisterApiProviders } from "../src/api-registry.js";
 import { getModel } from "../src/models.js";
@@ -10,7 +11,9 @@ import type {
 	Model,
 	StreamFunction,
 	StreamOptions,
+	TextContent,
 	ThinkingContent,
+	ToolCall,
 } from "../src/types.js";
 import { createAssistantMessageEventStream } from "../src/utils/event-stream.js";
 import {
@@ -194,6 +197,140 @@ function registerThrowingThinkingProvider(chunkCount: number) {
 	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
 }
 
+/**
+ * Provider that thinks, moves on to text or a tool call, and only sends the
+ * first output after a silence longer than the configured time budget, the way
+ * a slow first token looks to the wrapper.
+ */
+function registerLateOutputProvider(options: { phase: "text" | "toolcall"; silenceMs: number }) {
+	const api = `test-late-${options.phase}`;
+	const sourceId = `res-283-late-${options.phase}-provider`;
+	const chunk = "t".repeat(200);
+	const state = { abortedAfterPhase: false };
+	const model: Model<string> = {
+		id: `late-${options.phase}`,
+		name: `Late ${options.phase}`,
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			for (let index = 0; index < 2; index++) {
+				await sleep(1);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+
+			const contentIndex = 1;
+			if (options.phase === "text") {
+				const block: TextContent = { type: "text", text: "" };
+				partial.content = [thinking, block];
+				yield { type: "text_start", contentIndex, partial };
+				await sleep(options.silenceMs);
+				state.abortedAfterPhase = streamOptions?.signal?.aborted ?? false;
+				block.text = "design ready";
+				yield { type: "text_delta", contentIndex, delta: block.text, partial };
+				yield { type: "text_end", contentIndex, content: block.text, partial };
+				partial.stopReason = "stop";
+			} else {
+				const block: ToolCall = { type: "toolCall", id: "call-late", name: "measure", arguments: {} };
+				partial.content = [thinking, block];
+				yield { type: "toolcall_start", contentIndex, partial };
+				await sleep(options.silenceMs);
+				state.abortedAfterPhase = streamOptions?.signal?.aborted ?? false;
+				yield { type: "toolcall_delta", contentIndex, delta: "{}", partial };
+				yield { type: "toolcall_end", contentIndex, toolCall: block, partial };
+				partial.stopReason = "toolUse";
+			}
+			yield { type: "done", reason: options.phase === "text" ? "stop" : "toolUse", message: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
+ * Provider that ends its own stream with the `reasoning_limit` stop reason, the
+ * way an inner guard would, without this wrapper's own budget tripping.
+ */
+function registerPreLimitedProvider() {
+	const api = "test-pre-limited";
+	const sourceId = "res-283-pre-limited-provider";
+	const model: Model<string> = {
+		id: "pre-limited",
+		name: "Pre Limited",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+		reasoningLimits: { maxThinkingChars: 1_000_000 },
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "half a thought" }],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "reasoning_limit",
+			reasoningLimit: { reason: "max_thinking_chars", limit: 4, observed: 4 },
+			errorMessage:
+				"Reasoning limit reached: 4 characters of thinking without text or a tool call (limit 4 characters).",
+			timestamp: Date.now(),
+		};
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			yield { type: "thinking_delta", contentIndex: 0, delta: "half a thought", partial };
+			yield { type: "error", reason: "reasoning_limit", error: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, unregister: () => unregisterApiProviders(sourceId) };
+}
+
 beforeEach(() => {
 	mockState.lastParams = undefined;
 	mockState.lastSignal = undefined;
@@ -353,6 +490,72 @@ describe("reasoning runaway guard", () => {
 			expect(message.content.every((block) => block.type === "thinking")).toBe(true);
 			expect(thinkingOf(message)).toBe("t".repeat(2_000));
 			expect(message.usage.totalTokens).toBe(0);
+			expect(message.usageUnavailable).toBe("reasoning_limit");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("does not treat slow output after a thinking phase as runaway thinking", async () => {
+		for (const phase of ["text", "toolcall"] as const) {
+			const provider = registerLateOutputProvider({ phase, silenceMs: 250 });
+			try {
+				const { events, message } = await collect(
+					stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingMs: 50 } }),
+				);
+
+				// Starting text or a tool call leaves the thinking phase, so the
+				// time budget must not fire while that output is still slow.
+				expect(provider.state.abortedAfterPhase).toBe(false);
+				expect(message.stopReason).toBe(phase === "text" ? "stop" : "toolUse");
+				expect(message.reasoningLimit).toBeUndefined();
+				expect(events.some((event) => event.type === "error")).toBe(false);
+			} finally {
+				provider.unregister();
+			}
+		}
+	});
+
+	it("removes its upstream abort listener once the stream settles", async () => {
+		const model = zaiModel();
+		mockState.maxChunks = 2;
+		const controller = new AbortController();
+
+		// One agent run reuses the same signal for many model calls; every call
+		// must clean up after itself or Node starts warning about a leak.
+		for (let call = 0; call < 25; call++) {
+			await collect(
+				streamSimple(model, context, { apiKey: "test", reasoning: "medium", signal: controller.signal }),
+			);
+		}
+
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+	});
+
+	it("removes its upstream abort listener after the guard trips", async () => {
+		const model = zaiModel();
+		const controller = new AbortController();
+
+		const { message } = await collect(
+			streamSimple(model, context, { apiKey: "test", reasoning: "minimal", signal: controller.signal }),
+		);
+
+		expect(message.stopReason).toBe("reasoning_limit");
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+	});
+
+	it("settles a message that already carries reasoning_limit through the error variant", async () => {
+		const provider = registerPreLimitedProvider();
+		try {
+			const { events, message } = await collect(stream(provider.model, context, { apiKey: "test" }));
+
+			const errorReasons = events
+				.filter((event) => event.type === "error")
+				.map((event) => (event.type === "error" ? event.reason : undefined));
+			expect(errorReasons).toEqual(["reasoning_limit"]);
+			// `reasoning_limit` is a failure reason, never a `done`.
+			expect(events.some((event) => event.type === "done")).toBe(false);
+			expect(message.stopReason).toBe("reasoning_limit");
 			expect(message.usageUnavailable).toBe("reasoning_limit");
 		} finally {
 			provider.unregister();
