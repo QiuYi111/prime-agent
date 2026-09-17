@@ -96,6 +96,20 @@ function dropThinkingTail(message: AssistantMessage, contentIndex: number, dropp
 }
 
 /**
+ * Copy the content a message already carries. Providers keep writing to the
+ * blocks they streamed - usage lands on the same message, and one that ignores
+ * the abort can keep appending reasoning - so the boundary a turn was ended at
+ * needs its own blocks instead of a reference into the provider's live ones.
+ */
+function snapshotContent(content: AssistantMessage["content"]): AssistantMessage["content"] {
+	return content.map((block) => {
+		if (block.type === "thinking") return { ...block };
+		if (block.type === "text") return { ...block };
+		return { ...block, arguments: { ...block.arguments } };
+	});
+}
+
+/**
  * Enforce the local thinking budget around one provider stream.
  *
  * Providers whose request format is a plain thinking switch cannot honour the
@@ -142,11 +156,18 @@ function withReasoningLimits<TApi extends Api>(
 	let phaseTimer: ReturnType<typeof setTimeout> | undefined;
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
 	/**
-	 * Thinking length the result must keep once a delta was clipped. The
-	 * provider may hand its own untrimmed partial back while it unwinds, and that
-	 * message must not restore the over-budget tail.
+	 * Content delivered up to the moment the turn was terminated, frozen into
+	 * its own blocks. A provider can keep mutating the partial it handed over
+	 * while it unwinds - appending thinking a caller never saw, or restoring a
+	 * clipped tail - so the settled message takes its content from here and lets
+	 * a later terminal event contribute only usage and the end state.
 	 */
-	let thinkingTrim: { contentIndex: number; length: number } | undefined;
+	let frozenContent: AssistantMessage["content"] | undefined;
+
+	const freezeContent = (): void => {
+		if (frozenContent !== undefined) return;
+		frozenContent = partial ? snapshotContent(partial.content) : [];
+	};
 
 	const clearTimers = (): void => {
 		if (phaseTimer !== undefined) {
@@ -163,41 +184,38 @@ function withReasoningLimits<TApi extends Api>(
 		if (settled) return;
 		settled = true;
 		cleanup();
-		if (thinkingTrim) {
-			const block = message.content[thinkingTrim.contentIndex];
-			if (block?.type === "thinking" && block.thinking.length > thinkingTrim.length) {
-				block.thinking = block.thinking.slice(0, thinkingTrim.length);
-			}
-		}
+		// The turn ended at a boundary the provider may still be writing past.
+		// Own copy so those writes cannot reach the caller through the result.
+		const result = frozenContent ? { ...message, content: frozenContent } : message;
 		if (upstreamAborted) {
 			// The caller aborted while the provider was still unwinding, so the
 			// provider never labelled its own message. Keep what it streamed and
 			// report the abort instead of a success or a reasoning limit.
-			message.stopReason = "aborted";
-			message.reasoningLimit = undefined;
-			markUsageUnavailable(message, "aborted");
-			stream.push({ type: "error", reason: "aborted", error: message });
-			stream.end(message);
+			result.stopReason = "aborted";
+			result.reasoningLimit = undefined;
+			markUsageUnavailable(result, "aborted");
+			stream.push({ type: "error", reason: "aborted", error: result });
+			stream.end(result);
 			return;
 		}
-		if (trip || message.stopReason === "reasoning_limit") {
-			const details = trip ?? message.reasoningLimit;
-			message.stopReason = "reasoning_limit";
+		if (trip || result.stopReason === "reasoning_limit") {
+			const details = trip ?? result.reasoningLimit;
+			result.stopReason = "reasoning_limit";
 			if (details) {
-				message.reasoningLimit = details;
-				message.errorMessage = formatReasoningLimitMessage(details);
-			} else if (!message.errorMessage) {
-				message.errorMessage = "Reasoning limit reached.";
+				result.reasoningLimit = details;
+				result.errorMessage = formatReasoningLimitMessage(details);
+			} else if (!result.errorMessage) {
+				result.errorMessage = "Reasoning limit reached.";
 			}
-			markUsageUnavailable(message, "reasoning_limit");
-			stream.push({ type: "error", reason: "reasoning_limit", error: message });
-			stream.end(message);
+			markUsageUnavailable(result, "reasoning_limit");
+			stream.push({ type: "error", reason: "reasoning_limit", error: result });
+			stream.end(result);
 			return;
 		}
-		const terminal = terminalAssistantEvent(message);
-		if (terminal.type === "error") markUsageUnavailable(message, terminal.reason);
+		const terminal = terminalAssistantEvent(result);
+		if (terminal.type === "error") markUsageUnavailable(result, terminal.reason);
 		stream.push(terminal);
-		stream.end(message);
+		stream.end(result);
 	};
 
 	/**
@@ -254,6 +272,7 @@ function withReasoningLimits<TApi extends Api>(
 		// as a reasoning limit, and drop the pending deadline here rather than
 		// waiting for the provider to come back.
 		upstreamAborted = true;
+		freezeContent();
 		clearTimers();
 		controller.abort();
 		armSettleGrace("Caller aborted the stream.");
@@ -270,6 +289,7 @@ function withReasoningLimits<TApi extends Api>(
 	const abortForLimit = (details: ReasoningLimitDetails): void => {
 		if (upstreamAborted) return;
 		trip = details;
+		freezeContent();
 		clearTimers();
 		detachUpstreamAbort();
 		controller.abort();
@@ -310,38 +330,33 @@ function withReasoningLimits<TApi extends Api>(
 				// Once the budget is spent the stream is already terminating, and
 				// the partial is frozen at the clipped message. Dropping the rest
 				// keeps whatever the provider buffered ahead out of the result.
-				if (trip) continue;
+				// The caller's own stop is the same boundary: events a provider
+				// produces after it must not reach the caller either.
+				if (trip || upstreamAborted) continue;
 				// The newest partial is kept for the abort and error paths.
 				partial = event.partial;
-				if (!upstreamAborted) {
-					if (event.type === "thinking_start" || event.type === "thinking_delta") {
-						const thinking = guard.isThinking;
-						const budget = guard.observeThinkingDelta(event.type === "thinking_delta" ? event.delta.length : 0);
-						if (event.type === "thinking_delta" && budget.deliverableChars < event.delta.length) {
-							// This delta crosses the budget: hand the caller only the
-							// characters that still fit, and clip the partial the same way
-							// so the over-budget tail cannot come back through the result.
-							thinkingTrim = { contentIndex: event.contentIndex, length: guard.observedChars };
-							partial = dropThinkingTail(
-								partial,
-								event.contentIndex,
-								event.delta.length - budget.deliverableChars,
-							);
-							stream.push({ ...event, delta: event.delta.slice(0, budget.deliverableChars), partial });
-						} else {
-							stream.push(event);
-						}
-						if (budget.details) {
-							abortForLimit(budget.details);
-						} else if (!thinking) {
-							armPhaseDeadline();
-						}
-						continue;
+				if (event.type === "thinking_start" || event.type === "thinking_delta") {
+					const thinking = guard.isThinking;
+					const budget = guard.observeThinkingDelta(event.type === "thinking_delta" ? event.delta.length : 0);
+					if (event.type === "thinking_delta" && budget.deliverableChars < event.delta.length) {
+						// This delta crosses the budget: hand the caller only the
+						// characters that still fit, and clip the partial the same way
+						// so the over-budget tail cannot come back through the result.
+						partial = dropThinkingTail(partial, event.contentIndex, event.delta.length - budget.deliverableChars);
+						stream.push({ ...event, delta: event.delta.slice(0, budget.deliverableChars), partial });
+					} else {
+						stream.push(event);
 					}
-					if (THINKING_PHASE_END_EVENTS.has(event.type)) {
-						guard.reset();
-						clearTimers();
+					if (budget.details) {
+						abortForLimit(budget.details);
+					} else if (!thinking) {
+						armPhaseDeadline();
 					}
+					continue;
+				}
+				if (THINKING_PHASE_END_EVENTS.has(event.type)) {
+					guard.reset();
+					clearTimers();
 				}
 				stream.push(event);
 			}

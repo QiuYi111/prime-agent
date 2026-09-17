@@ -767,6 +767,148 @@ function registerChunkedThinkingProvider(options: { chunks: string[]; report: "t
 	return { model, unregister: () => unregisterApiProviders(sourceId) };
 }
 
+/**
+ * Provider that treats the abort signal as a suggestion: it keeps streaming
+ * thinking after the caller stopped the turn, and only then names a terminal
+ * event of its own. The stop is the content boundary, so the extra deltas may
+ * neither reach the caller nor come back through the provider's final message.
+ */
+function registerAbortIgnoringProvider(options: { beforeAbort: string[]; afterAbort: string[] }) {
+	const api = "test-abort-ignoring";
+	const sourceId = "res-283-abort-ignoring-provider";
+	const model: Model<string> = {
+		id: "abort-ignoring",
+		name: "Abort Ignoring",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (const chunk of options.beforeAbort) {
+				await sleep(1);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			await new Promise<void>((resolve) => {
+				if (streamOptions?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				streamOptions?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			// The caller already stopped the turn; this provider streams on anyway.
+			for (const chunk of options.afterAbort) {
+				await sleep(5);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			partial.stopReason = "stop";
+			yield { type: "done", reason: "stop", message: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
+ * Provider that keeps writing into the thinking block the wrapper already saw
+ * after the turn was stopped, then names a terminal event carrying that same
+ * message. The reasoning deadline is the content boundary, so the appended text
+ * must not show up in the result even though it lands in the live block object.
+ */
+function registerInPlaceThinkingProvider(options: { before: string[]; appendedAfterStop: string[] }) {
+	const api = "test-in-place-thinking";
+	const sourceId = "res-283-in-place-thinking-provider";
+	const model: Model<string> = {
+		id: "in-place-thinking",
+		name: "In Place Thinking",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (const chunk of options.before) {
+				await sleep(5);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			await new Promise<void>((resolve) => {
+				if (streamOptions?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				streamOptions?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			// Same block object the wrapper already snapshotted; no delta events.
+			for (const chunk of options.appendedAfterStop) thinking.thinking += chunk;
+			partial.stopReason = "stop";
+			yield { type: "done", reason: "stop", message: partial };
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, unregister: () => unregisterApiProviders(sourceId) };
+}
+
 beforeEach(() => {
 	mockState.lastParams = undefined;
 	mockState.lastSignal = undefined;
@@ -1089,6 +1231,71 @@ describe("reasoning runaway guard", () => {
 			expect(message.reasoningLimit).toBeUndefined();
 			expect(thinkingOf(message)).toBe("t".repeat(600));
 			expect(message.usageUnavailable).toBe("aborted");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("stops at the caller abort even when the provider keeps streaming", async () => {
+		const chunk = "t".repeat(200);
+		const provider = registerAbortIgnoringProvider({
+			beforeAbort: [chunk, chunk, chunk],
+			afterAbort: [chunk, chunk],
+		});
+		try {
+			const controller = new AbortController();
+			const streamResult = stream(provider.model, context, {
+				apiKey: "test",
+				reasoningLimits: { maxThinkingChars: 1_000_000 },
+				signal: controller.signal,
+			});
+
+			// The caller stops the turn on the third delta; the provider then keeps
+			// going and finishes with a `done` of its own.
+			const events: AssistantMessageEvent[] = [];
+			let thinkingDeltas = 0;
+			for await (const event of streamResult) {
+				events.push(event);
+				if (event.type === "thinking_delta" && ++thinkingDeltas === 3) controller.abort();
+			}
+			const message = await streamResult.result();
+
+			// The stop is the content boundary: the two deltas that arrived after it
+			// never reach the caller, and the provider's terminal message cannot
+			// bring them back through the result.
+			expect(events.filter((event) => event.type === "thinking_delta")).toHaveLength(3);
+			expect(deliveredThinking(events)).toBe(chunk.repeat(3));
+			expect(thinkingOf(message)).toBe(chunk.repeat(3));
+			expect(message.stopReason).toBe("aborted");
+			expect(message.reasoningLimit).toBeUndefined();
+			expect(message.usageUnavailable).toBe("aborted");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("freezes the time-limit boundary against a provider that appends in place", async () => {
+		const chunk = "t".repeat(200);
+		const provider = registerInPlaceThinkingProvider({
+			before: [chunk, chunk, chunk],
+			appendedAfterStop: [chunk, chunk],
+		});
+		try {
+			const streamResult = stream(provider.model, context, {
+				apiKey: "test",
+				reasoningLimits: { maxThinkingMs: 40 },
+			});
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamResult) events.push(event);
+			const message = await streamResult.result();
+
+			// The deadline is the boundary. The provider kept appending to the same
+			// block afterwards, and the terminal event handed that grown message
+			// back, but only what the caller had already received may survive.
+			expect(message.stopReason).toBe("reasoning_limit");
+			expect(message.reasoningLimit?.reason).toBe("max_thinking_ms");
+			expect(deliveredThinking(events)).toBe(chunk.repeat(3));
+			expect(thinkingOf(message)).toBe(chunk.repeat(3));
 		} finally {
 			provider.unregister();
 		}
