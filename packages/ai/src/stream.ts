@@ -54,14 +54,25 @@ function failedMessage<TApi extends Api>(model: Model<TApi>, errorMessage: strin
 }
 
 /**
+ * Time a provider gets to hand back its own final message after the stream was
+ * aborted for a reasoning limit. Providers that observe the abort report the
+ * partial message themselves, usually with real usage; one that keeps sitting
+ * on the stream must not keep the caller waiting for it.
+ */
+const REASONING_LIMIT_SETTLE_GRACE_MS = 500;
+
+/**
  * Enforce the local thinking budget around one provider stream.
  *
  * Providers whose request format is a plain thinking switch cannot honour the
  * requested thinking level, so the kernel watches the thinking that arrives
  * without any text or tool output and aborts the provider stream once a
- * configured limit is reached. The partial message is kept, the stop reason
- * becomes `reasoning_limit`, and usage that was never reported is marked
- * unavailable instead of being recorded as a real zero.
+ * configured limit is reached. Character and token limits are checked as
+ * deltas arrive, the time limit is a real deadline so a provider that goes
+ * quiet mid-thinking is stopped too, and whatever partial message the provider
+ * already produced is kept. The stop reason becomes `reasoning_limit`, and
+ * usage that was never reported is marked unavailable instead of being
+ * recorded as a real zero.
  */
 function withReasoningLimits<TApi extends Api>(
 	model: Model<TApi>,
@@ -85,8 +96,28 @@ function withReasoningLimits<TApi extends Api>(
 	const inner = run({ ...(options ?? {}), signal: controller.signal } as StreamOptions);
 	const stream = new AssistantMessageEventStream();
 	let trip: ReasoningLimitDetails | undefined;
+	/** Newest partial the provider reported, kept for the abort and error paths. */
+	let partial: AssistantMessage | undefined;
+	let settled = false;
+	/** Deadline for the open thinking phase, so a silent provider still stops. */
+	let phaseTimer: ReturnType<typeof setTimeout> | undefined;
+	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const clearTimers = (): void => {
+		if (phaseTimer !== undefined) {
+			clearTimeout(phaseTimer);
+			phaseTimer = undefined;
+		}
+		if (graceTimer !== undefined) {
+			clearTimeout(graceTimer);
+			graceTimer = undefined;
+		}
+	};
 
 	const settle = (message: AssistantMessage): void => {
+		if (settled) return;
+		settled = true;
+		clearTimers();
 		if (trip) {
 			message.stopReason = "reasoning_limit";
 			message.reasoningLimit = trip;
@@ -110,36 +141,83 @@ function withReasoningLimits<TApi extends Api>(
 		stream.end(message);
 	};
 
+	/**
+	 * Settle with what the provider already streamed. An abort or a provider
+	 * error must not replace the partial thinking with an empty failure message.
+	 */
+	const settleWithPartial = (fallbackError: string): void => {
+		settle(partial ?? failedMessage(model, fallbackError));
+	};
+
+	/** Stop the provider stream and give it a bounded moment to report its own final message. */
+	const abortForLimit = (details: ReasoningLimitDetails): void => {
+		trip = details;
+		clearTimers();
+		controller.abort();
+		graceTimer = setTimeout(
+			() => settleWithPartial(formatReasoningLimitMessage(details)),
+			REASONING_LIMIT_SETTLE_GRACE_MS,
+		);
+	};
+
+	function onPhaseDeadline(): void {
+		phaseTimer = undefined;
+		if (settled || trip) return;
+		const details = guard.check();
+		if (details) {
+			abortForLimit(details);
+			return;
+		}
+		// Timers can fire marginally early; wait out the remainder of the phase.
+		phaseTimer = setTimeout(onPhaseDeadline, Math.max(1, guard.remainingMs ?? 1));
+	}
+
+	function armPhaseDeadline(): void {
+		const remaining = guard.remainingMs;
+		if (remaining === undefined || phaseTimer !== undefined) return;
+		phaseTimer = setTimeout(onPhaseDeadline, Math.max(1, remaining));
+	}
+
 	void (async () => {
 		let terminal: AssistantMessageEvent | undefined;
 		try {
 			for await (const event of inner) {
+				if (settled) break;
 				if (event.type === "done" || event.type === "error") {
 					terminal = event;
 					continue;
 				}
+				// The newest partial is kept even after the budget is spent: the
+				// provider may have buffered slightly ahead and those blocks are
+				// still what the caller should end up with.
+				partial = event.partial;
 				// Once the budget is spent the stream is already terminating;
 				// stop delivering further deltas so callers never see thinking
-				// beyond the limit. The provider's partial message (which may
-				// buffer slightly ahead) is still kept in the terminal event.
+				// beyond the limit.
 				if (trip) continue;
-				if (event.type === "thinking_delta") {
-					trip = guard.observeThinking(event.delta.length);
-					if (trip) controller.abort();
+				if (event.type === "thinking_start" || event.type === "thinking_delta") {
+					const thinking = guard.isThinking;
+					const details = guard.observeThinking(event.type === "thinking_delta" ? event.delta.length : 0);
+					if (details) {
+						abortForLimit(details);
+					} else if (!thinking) {
+						armPhaseDeadline();
+					}
 				} else if (event.type === "text_delta" || event.type === "toolcall_delta") {
 					guard.reset();
+					clearTimers();
 				}
 				stream.push(event);
 			}
 		} catch (error) {
-			settle(failedMessage(model, error instanceof Error ? error.message : String(error)));
+			settleWithPartial(error instanceof Error ? error.message : String(error));
 			return;
 		}
 
 		const message =
 			terminal?.type === "done" ? terminal.message : terminal?.type === "error" ? terminal.error : undefined;
 		if (!message) {
-			settle(failedMessage(model, "Provider stream ended without a terminal event"));
+			settleWithPartial("Provider stream ended without a terminal event");
 			return;
 		}
 		settle(message);

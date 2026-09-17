@@ -166,6 +166,28 @@ export class ReasoningRunawayGuard {
 		this.thinkingStartedAt = null;
 	}
 
+	/** True while a thinking phase is open, meaning no text or tool output arrived since it started. */
+	get isThinking(): boolean {
+		return this.thinkingStartedAt !== null;
+	}
+
+	/**
+	 * Milliseconds left in the current thinking phase before the time limit
+	 * trips. `undefined` when the limits have no time limit or no phase is open.
+	 * Callers use this to arm a real deadline instead of waiting for the next
+	 * delta, so a provider that goes quiet mid-thinking is still stopped.
+	 */
+	get remainingMs(): number | undefined {
+		const { maxThinkingMs } = this.limits;
+		if (maxThinkingMs === undefined || this.thinkingStartedAt === null) return undefined;
+		return Math.max(0, this.thinkingStartedAt + maxThinkingMs - this.now());
+	}
+
+	/** Evaluate the open phase without new output; used by the deadline timer. */
+	check(): ReasoningLimitDetails | undefined {
+		return this.evaluate(this.now());
+	}
+
 	get observedChars(): number {
 		return this.thinkingChars;
 	}

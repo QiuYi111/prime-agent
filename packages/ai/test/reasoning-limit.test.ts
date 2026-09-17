@@ -1,7 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { registerApiProvider, unregisterApiProviders } from "../src/api-registry.js";
 import { getModel } from "../src/models.js";
-import { streamSimple } from "../src/stream.js";
-import type { AssistantMessage, AssistantMessageEvent, Context, ThinkingContent } from "../src/types.js";
+import { stream, streamSimple } from "../src/stream.js";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	StreamFunction,
+	StreamOptions,
+	ThinkingContent,
+} from "../src/types.js";
+import { createAssistantMessageEventStream } from "../src/utils/event-stream.js";
 import {
 	LOCAL_THINKING_LEVEL_LIMITS,
 	ReasoningRunawayGuard,
@@ -10,12 +21,15 @@ import {
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as any,
+	lastSignal: undefined as AbortSignal | undefined,
 	thinkingChunk: "t".repeat(500),
 	/** Emit a usage chunk once this many reasoning chunks were sent. */
 	usageAfterChunks: Number.POSITIVE_INFINITY,
 	usage: undefined as any,
 	/** Finish normally after this many chunks (Infinity = runaway). */
 	maxChunks: Number.POSITIVE_INFINITY,
+	/** Sit silent and ignore the abort once this many chunks were sent. */
+	silentAfterChunks: Number.POSITIVE_INFINITY,
 	delayMs: 0,
 	sawAbort: false,
 }));
@@ -27,6 +41,7 @@ vi.mock("openai", () => {
 				create: (params: unknown, requestOptions: { signal?: AbortSignal } | undefined) => {
 					mockState.lastParams = params;
 					const signal = requestOptions?.signal;
+					mockState.lastSignal = signal;
 					const stream = {
 						async *[Symbol.asyncIterator]() {
 							let chunkIndex = 0;
@@ -36,6 +51,10 @@ vi.mock("openai", () => {
 									const error = new Error("Request was aborted.");
 									error.name = "AbortError";
 									throw error;
+								}
+								if (chunkIndex >= mockState.silentAfterChunks) {
+									// Provider stuck mid-thinking: no more events, no abort awareness.
+									await new Promise<never>(() => {});
 								}
 								if (mockState.delayMs > 0) {
 									await new Promise((resolve) => setTimeout(resolve, mockState.delayMs));
@@ -85,7 +104,7 @@ const context: Context = {
 };
 
 async function collect(
-	streamResult: ReturnType<typeof streamSimple>,
+	streamResult: AssistantMessageEventStream,
 ): Promise<{ events: AssistantMessageEvent[]; message: AssistantMessage }> {
 	const events: AssistantMessageEvent[] = [];
 	for await (const event of streamResult) {
@@ -108,11 +127,80 @@ function zaiModel() {
 	return model;
 }
 
+/**
+ * Provider that streams thinking and then throws while unwinding the abort
+ * instead of reporting a terminal event, the way an inner stream that rejects
+ * reaches the wrapper. Its own limits come from `Model.reasoningLimits`.
+ */
+function registerThrowingThinkingProvider(chunkCount: number) {
+	const api = "test-throwing-thinking";
+	const sourceId = "res-283-throwing-thinking-provider";
+	const chunk = "t".repeat(500);
+	const state = { aborted: false };
+	const model: Model<string> = {
+		id: "throwing-thinking",
+		name: "Throwing Thinking",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+		reasoningLimits: { maxThinkingChars: 2_000 },
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, options) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const block: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [block];
+			for (let index = 0; index < chunkCount; index++) {
+				await new Promise((resolve) => setTimeout(resolve, 1));
+				block.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			await new Promise<void>((resolve) => {
+				if (options?.signal?.aborted) {
+					resolve();
+					return;
+				}
+				options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			state.aborted = true;
+			throw new Error("Request was aborted");
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
 beforeEach(() => {
 	mockState.lastParams = undefined;
+	mockState.lastSignal = undefined;
 	mockState.usage = undefined;
 	mockState.usageAfterChunks = Number.POSITIVE_INFINITY;
 	mockState.maxChunks = Number.POSITIVE_INFINITY;
+	mockState.silentAfterChunks = Number.POSITIVE_INFINITY;
 	mockState.delayMs = 0;
 	mockState.sawAbort = false;
 	mockState.thinkingChunk = "t".repeat(500);
@@ -219,6 +307,56 @@ describe("reasoning runaway guard", () => {
 
 		expect(message.stopReason).toBe("reasoning_limit");
 		expect(message.reasoningLimit?.reason).toBe("max_thinking_ms");
+	});
+
+	it("stops a thinking phase that goes silent on the deadline alone", async () => {
+		const model = zaiModel();
+		mockState.delayMs = 10;
+		// Three thinking chunks, then a provider that never sends another event
+		// and never notices the abort.
+		mockState.silentAfterChunks = 3;
+
+		const { message } = await collect(
+			streamSimple(model, context, {
+				apiKey: "test",
+				reasoning: "medium",
+				reasoningLimits: { maxThinkingMs: 50 },
+			}),
+		);
+
+		// No further delta arrived, so only the timer could end this stream.
+		expect(mockState.sawAbort).toBe(false);
+		expect(mockState.lastSignal?.aborted).toBe(true);
+		expect(message.stopReason).toBe("reasoning_limit");
+		expect(message.reasoningLimit?.reason).toBe("max_thinking_ms");
+		expect(message.reasoningLimit?.observed).toBeGreaterThanOrEqual(50);
+		// Thinking that arrived before the provider stalled is kept.
+		expect(thinkingOf(message)).toBe("t".repeat(1_500));
+		expect(message.usageUnavailable).toBe("reasoning_limit");
+	});
+
+	it("keeps the partial thinking when an aborted provider stream throws", async () => {
+		const provider = registerThrowingThinkingProvider(4);
+		try {
+			const { message } = await collect(stream(provider.model, context, { apiKey: "test" }));
+
+			expect(provider.state.aborted).toBe(true);
+			expect(message.stopReason).toBe("reasoning_limit");
+			expect(message.reasoningLimit).toEqual({
+				reason: "max_thinking_chars",
+				limit: 2_000,
+				observed: 2_000,
+			});
+			// The thinking that was already streamed survives the throw instead of
+			// being replaced by an empty failure message.
+			expect(message.content).toHaveLength(1);
+			expect(message.content.every((block) => block.type === "thinking")).toBe(true);
+			expect(thinkingOf(message)).toBe("t".repeat(2_000));
+			expect(message.usage.totalTokens).toBe(0);
+			expect(message.usageUnavailable).toBe("reasoning_limit");
+		} finally {
+			provider.unregister();
+		}
 	});
 
 	it("does not trip while the model interleaves thinking with output", async () => {
