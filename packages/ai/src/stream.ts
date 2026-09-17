@@ -76,6 +76,12 @@ const THINKING_PHASE_END_EVENTS = new Set<AssistantMessageEvent["type"]>([
 ]);
 
 /**
+ * Stop reasons that already name a failure. A partial that carries one of them
+ * describes its own end, so settling it keeps that reason.
+ */
+const FAILURE_STOP_REASONS = new Set<AssistantMessage["stopReason"]>(["error", "aborted", "reasoning_limit"]);
+
+/**
  * Enforce the local thinking budget around one provider stream.
  *
  * Providers whose request format is a plain thinking switch cannot honour the
@@ -169,9 +175,27 @@ function withReasoningLimits<TApi extends Api>(
 	/**
 	 * Settle with what the provider already streamed. An abort or a provider
 	 * error must not replace the partial thinking with an empty failure message.
+	 *
+	 * This only runs when the provider never named its own terminal, so the
+	 * partial must not be allowed to report a success: it still carries the
+	 * provider's initial `stop` until the turn really ends, and passing that
+	 * straight to `settle` would turn a plain failure - a rejected iterator, a
+	 * stream closed without a terminal event - into a completed turn. Keep the
+	 * partial content and usage, and label the message as an error instead. The
+	 * abort and limit paths are settled by `settle` itself, which owns their
+	 * terminal reason.
 	 */
 	const settleWithPartial = (fallbackError: string): void => {
-		settle(partial ?? failedMessage(model, fallbackError));
+		// The loop settles and breaks as soon as the provider names its own
+		// terminal, and the settle below still runs once after that break. Leave
+		// a finished turn alone.
+		if (settled) return;
+		const message = partial ?? failedMessage(model, fallbackError);
+		if (!upstreamAborted && !trip && !FAILURE_STOP_REASONS.has(message.stopReason)) {
+			message.stopReason = "error";
+			if (!message.errorMessage) message.errorMessage = fallbackError;
+		}
+		settle(message);
 	};
 
 	/**

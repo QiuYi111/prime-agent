@@ -123,6 +123,13 @@ function thinkingOf(message: AssistantMessage): string {
 		.join("");
 }
 
+function textOf(message: AssistantMessage): string {
+	return message.content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+}
+
 function zaiModel() {
 	const model = getModel("zai", "glm-5.3")!;
 	expect(model.compat?.thinkingFormat).toBe("zai");
@@ -615,6 +622,71 @@ function registerPreLimitedProvider() {
 	return { model, unregister: () => unregisterApiProviders(sourceId) };
 }
 
+/**
+ * Provider whose turn fails on its own, with no caller abort and no budget
+ * trip: it streams part of a turn and then either rejects with a plain provider
+ * error or closes its iterator without ever naming a terminal event. Either
+ * way the partial message is all the wrapper has to settle with, and that
+ * partial still carries the provider's initial `stop`.
+ */
+function registerFailingProvider(options: { outcome: "throw" | "eof" }) {
+	const api = `test-failing-${options.outcome}`;
+	const sourceId = `res-283-failing-${options.outcome}-provider`;
+	const chunk = "t".repeat(200);
+	const state = { streamed: false };
+	const model: Model<string> = {
+		id: `failing-${options.outcome}`,
+		name: `Failing ${options.outcome}`,
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			thinking.thinking += chunk;
+			yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			const text: TextContent = { type: "text", text: "" };
+			partial.content = [thinking, text];
+			yield { type: "text_start", contentIndex: 1, partial };
+			text.text = "design ready";
+			yield { type: "text_delta", contentIndex: 1, delta: text.text, partial };
+			state.streamed = true;
+			if (options.outcome === "throw") throw new Error("socket hang up");
+			// Closed without a terminal event, so nothing ever named the end of this turn.
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
 beforeEach(() => {
 	mockState.lastParams = undefined;
 	mockState.lastSignal = undefined;
@@ -944,6 +1016,52 @@ describe("reasoning runaway guard", () => {
 			expect(events.some((event) => event.type === "done")).toBe(false);
 			expect(message.stopReason).toBe("reasoning_limit");
 			expect(message.usageUnavailable).toBe("reasoning_limit");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("settles a plain provider failure as an error even when a partial turn arrived", async () => {
+		const provider = registerFailingProvider({ outcome: "throw" });
+		try {
+			const { events, message } = await collect(
+				stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingChars: 1_000_000 } }),
+			);
+
+			// A rejected iterator is a failed turn, not a finished one: the partial
+			// message still carries the provider's initial `stop`, and reporting
+			// that as a success would hide the failure from the caller.
+			expect(provider.state.streamed).toBe(true);
+			expect(events.some((event) => event.type === "done")).toBe(false);
+			expect(events.filter((event) => event.type === "error").map((event) => event.reason)).toEqual(["error"]);
+			expect(message.stopReason).toBe("error");
+			expect(message.errorMessage).toBe("socket hang up");
+			// What the provider streamed before failing survives.
+			expect(thinkingOf(message)).toBe("t".repeat(200));
+			expect(textOf(message)).toBe("design ready");
+			expect(message.usageUnavailable).toBe("error");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("settles a stream that closes without a terminal event as an error", async () => {
+		const provider = registerFailingProvider({ outcome: "eof" });
+		try {
+			const { events, message } = await collect(
+				stream(provider.model, context, { apiKey: "test", reasoningLimits: { maxThinkingChars: 1_000_000 } }),
+			);
+
+			// Closing the iterator is not a terminal event either, so the partial
+			// must not be read as a successful `stop`.
+			expect(provider.state.streamed).toBe(true);
+			expect(events.some((event) => event.type === "done")).toBe(false);
+			expect(events.filter((event) => event.type === "error").map((event) => event.reason)).toEqual(["error"]);
+			expect(message.stopReason).toBe("error");
+			expect(message.errorMessage).toBe("Provider stream ended without a terminal event");
+			expect(thinkingOf(message)).toBe("t".repeat(200));
+			expect(textOf(message)).toBe("design ready");
+			expect(message.usageUnavailable).toBe("error");
 		} finally {
 			provider.unregister();
 		}
