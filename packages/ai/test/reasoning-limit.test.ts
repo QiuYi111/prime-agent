@@ -425,6 +425,144 @@ function registerSlowAbortProvider(options: { unwindMs: number; report: "aborted
 }
 
 /**
+ * Provider that streams thinking and then stops sending events entirely: it
+ * never reports a terminal event and never looks at the abort signal, the way a
+ * provider that is wedged on its own socket behaves. The caller can stop the
+ * turn, but only a bounded settle in the wrapper can bring the turn back.
+ */
+function registerStalledProvider(options: { chunkCount: number }) {
+	const api = "test-stalled";
+	const sourceId = "res-283-stalled-provider";
+	const chunk = "t".repeat(200);
+	const state = { abortSignalled: false };
+	const model: Model<string> = {
+		id: "stalled",
+		name: "Stalled",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel, _context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			// Note that the abort arrived, without ever acting on it.
+			streamOptions?.signal?.addEventListener(
+				"abort",
+				() => {
+					state.abortSignalled = true;
+				},
+				{ once: true },
+			);
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			for (let index = 0; index < options.chunkCount; index++) {
+				await sleep(1);
+				thinking.thinking += chunk;
+				yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			}
+			// Wedged: no further event, no failure, nothing to await.
+			await new Promise<never>(() => {});
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, state, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
+ * Provider that reports its own terminal event and only closes its iterator a
+ * while later, the way an inner stream that is still unwinding reaches the
+ * wrapper. `onClosing` fires inside that window, so the caller can stop the turn
+ * after the provider already finished it.
+ */
+function registerSlowClosingProvider(options: { closeMs: number; onClosing: () => void }) {
+	const api = "test-slow-closing";
+	const sourceId = "res-283-slow-closing-provider";
+	const chunk = "t".repeat(200);
+	const model: Model<string> = {
+		id: "slow-closing",
+		name: "Slow Closing",
+		api,
+		provider: "test",
+		baseUrl: "http://localhost:0",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+	const streamFn: StreamFunction<string, StreamOptions> = (requestModel) => {
+		const outer = createAssistantMessageEventStream();
+		const partial: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api,
+			provider: model.provider,
+			model: requestModel.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		outer[Symbol.asyncIterator] = async function* (): AsyncGenerator<AssistantMessageEvent, void> {
+			yield { type: "start", partial };
+			const thinking: ThinkingContent = { type: "thinking", thinking: "" };
+			partial.content = [thinking];
+			yield { type: "thinking_start", contentIndex: 0, partial };
+			thinking.thinking += chunk;
+			yield { type: "thinking_delta", contentIndex: 0, delta: chunk, partial };
+			const text: TextContent = { type: "text", text: "" };
+			partial.content = [thinking, text];
+			yield { type: "text_start", contentIndex: 1, partial };
+			text.text = "design ready";
+			yield { type: "text_delta", contentIndex: 1, delta: text.text, partial };
+			partial.stopReason = "stop";
+
+			// The turn is finished as far as the provider is concerned, but the
+			// iterator stays open a while longer.
+			setTimeout(() => options.onClosing(), 20);
+			yield { type: "done", reason: "stop", message: partial };
+			await sleep(options.closeMs);
+		};
+		return outer;
+	};
+	registerApiProvider({ api, stream: streamFn, streamSimple: streamFn }, sourceId);
+	return { model, unregister: () => unregisterApiProviders(sourceId) };
+}
+
+/**
  * Provider that ends its own stream with the `reasoning_limit` stop reason, the
  * way an inner guard would, without this wrapper's own budget tripping.
  */
@@ -723,6 +861,61 @@ describe("reasoning runaway guard", () => {
 			} finally {
 				provider.unregister();
 			}
+		}
+	});
+
+	it("settles a caller abort even when the provider never answers the abort", async () => {
+		const provider = registerStalledProvider({ chunkCount: 3 });
+		try {
+			const controller = new AbortController();
+			const streamResult = stream(provider.model, context, {
+				apiKey: "test",
+				reasoningLimits: { maxThinkingMs: 60_000 },
+				signal: controller.signal,
+			});
+
+			// The caller stops the turn while the provider is wedged mid-thinking.
+			let thinkingDeltas = 0;
+			for await (const event of streamResult) {
+				if (event.type === "thinking_delta" && ++thinkingDeltas === 3) controller.abort();
+			}
+			const message = await streamResult.result();
+
+			// The provider was told to stop and ignored it, so only the bounded
+			// settle can bring this turn back.
+			expect(provider.state.abortSignalled).toBe(true);
+			expect(message.stopReason).toBe("aborted");
+			expect(message.reasoningLimit).toBeUndefined();
+			expect(thinkingOf(message)).toBe("t".repeat(600));
+			expect(message.usageUnavailable).toBe("aborted");
+		} finally {
+			provider.unregister();
+		}
+	});
+
+	it("keeps the provider terminal when the caller aborts while the stream is still closing", async () => {
+		const controller = new AbortController();
+		const provider = registerSlowClosingProvider({ closeMs: 300, onClosing: () => controller.abort() });
+		try {
+			const streamResult = stream(provider.model, context, {
+				apiKey: "test",
+				reasoningLimits: { maxThinkingMs: 60_000 },
+				signal: controller.signal,
+			});
+			const { events, message } = await collect(streamResult);
+
+			// The stop lands while the provider is still closing its stream, after
+			// it already reported the end of the turn. First terminal wins.
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			expect(controller.signal.aborted).toBe(true);
+			expect(message.stopReason).toBe("stop");
+			expect(message.reasoningLimit).toBeUndefined();
+			expect(message.errorMessage).toBeUndefined();
+			expect(events.some((event) => event.type === "done")).toBe(true);
+			expect(events.some((event) => event.type === "error")).toBe(false);
+			expect(thinkingOf(message)).toBe("t".repeat(200));
+		} finally {
+			provider.unregister();
 		}
 	});
 

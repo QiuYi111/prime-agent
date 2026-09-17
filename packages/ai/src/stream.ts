@@ -54,11 +54,12 @@ function failedMessage<TApi extends Api>(model: Model<TApi>, errorMessage: strin
 
 /**
  * Time a provider gets to hand back its own final message after the stream was
- * aborted for a reasoning limit. Providers that observe the abort report the
- * partial message themselves, usually with real usage; one that keeps sitting
- * on the stream must not keep the caller waiting for it.
+ * aborted, either by the reasoning limit or by the caller. Providers that
+ * observe the abort report the partial message themselves, usually with real
+ * usage; one that keeps sitting on the stream must not keep the caller waiting
+ * for it.
  */
-const REASONING_LIMIT_SETTLE_GRACE_MS = 500;
+const ABORT_SETTLE_GRACE_MS = 500;
 
 /**
  * Events that prove the model left the thinking phase: either the thinking
@@ -91,7 +92,10 @@ const THINKING_PHASE_END_EVENTS = new Set<AssistantMessageEvent["type"]>([
  * A caller abort outranks the deadline: whoever asked to stop first owns the
  * terminal reason, so the deadline is disarmed as soon as the upstream signal
  * aborts and a slow provider that only answers back afterwards still settles as
- * `aborted`.
+ * `aborted`. A provider that never answers back must not park the caller, so an
+ * abort also arms the same bounded settle the limit path uses. The reverse
+ * order matters just as much: a terminal the provider already reported wins,
+ * and a stop that arrives while that stream is still closing is ignored.
  */
 function withReasoningLimits<TApi extends Api>(
 	model: Model<TApi>,
@@ -126,36 +130,6 @@ function withReasoningLimits<TApi extends Api>(
 			graceTimer = undefined;
 		}
 	};
-
-	const detachUpstreamAbort = (): void => {
-		upstreamSignal?.removeEventListener("abort", forwardAbort);
-	};
-
-	const cleanup = (): void => {
-		clearTimers();
-		detachUpstreamAbort();
-	};
-
-	// Named so it can be removed when the stream settles: one agent run reuses
-	// the same signal for many model calls, and anonymous listeners would pile
-	// up until Node starts warning about a leak.
-	const forwardAbort = (): void => {
-		// The caller stopped the turn. Record that before anything else so the
-		// deadline cannot fire while the provider unwinds and rewrite the turn
-		// as a reasoning limit, and drop the pending deadline here rather than
-		// waiting for the provider to come back.
-		upstreamAborted = true;
-		clearTimers();
-		controller.abort();
-	};
-	if (upstreamSignal) {
-		if (upstreamSignal.aborted) {
-			upstreamAborted = true;
-			controller.abort();
-		} else {
-			upstreamSignal.addEventListener("abort", forwardAbort, { once: true });
-		}
-	}
 
 	const settle = (message: AssistantMessage): void => {
 		if (settled) return;
@@ -200,6 +174,46 @@ function withReasoningLimits<TApi extends Api>(
 		settle(partial ?? failedMessage(model, fallbackError));
 	};
 
+	/**
+	 * Give the provider a bounded moment to report its own final message, then
+	 * settle with what already arrived. Without this a provider that ignores the
+	 * abort would leave the caller waiting on a stream that never ends.
+	 */
+	const armSettleGrace = (fallbackError: string): void => {
+		if (graceTimer !== undefined) return;
+		graceTimer = setTimeout(() => settleWithPartial(fallbackError), ABORT_SETTLE_GRACE_MS);
+	};
+
+	const detachUpstreamAbort = (): void => {
+		upstreamSignal?.removeEventListener("abort", forwardAbort);
+	};
+
+	const cleanup = (): void => {
+		clearTimers();
+		detachUpstreamAbort();
+	};
+
+	// Named so it can be removed when the stream settles: one agent run reuses
+	// the same signal for many model calls, and anonymous listeners would pile
+	// up until Node starts warning about a leak.
+	const forwardAbort = (): void => {
+		// The caller stopped the turn. Record that before anything else so the
+		// deadline cannot fire while the provider unwinds and rewrite the turn
+		// as a reasoning limit, and drop the pending deadline here rather than
+		// waiting for the provider to come back.
+		upstreamAborted = true;
+		clearTimers();
+		controller.abort();
+		armSettleGrace("Caller aborted the stream.");
+	};
+	if (upstreamSignal) {
+		if (upstreamSignal.aborted) {
+			forwardAbort();
+		} else {
+			upstreamSignal.addEventListener("abort", forwardAbort, { once: true });
+		}
+	}
+
 	/** Stop the provider stream and give it a bounded moment to report its own final message. */
 	const abortForLimit = (details: ReasoningLimitDetails): void => {
 		if (upstreamAborted) return;
@@ -207,10 +221,7 @@ function withReasoningLimits<TApi extends Api>(
 		clearTimers();
 		detachUpstreamAbort();
 		controller.abort();
-		graceTimer = setTimeout(
-			() => settleWithPartial(formatReasoningLimitMessage(details)),
-			REASONING_LIMIT_SETTLE_GRACE_MS,
-		);
+		armSettleGrace(formatReasoningLimitMessage(details));
 	};
 
 	function onPhaseDeadline(): void {
@@ -233,13 +244,16 @@ function withReasoningLimits<TApi extends Api>(
 	}
 
 	void (async () => {
-		let terminal: AssistantMessageEvent | undefined;
 		try {
 			for await (const event of inner) {
 				if (settled) break;
 				if (event.type === "done" || event.type === "error") {
-					terminal = event;
-					continue;
+					// The provider named the end of this turn, so settle it right here.
+					// Only waiting for the iterator to close would leave a window where a
+					// caller abort that arrives while the stream is still unwinding
+					// rewrites a finished turn as `aborted`.
+					settle(event.type === "done" ? event.message : event.error);
+					break;
 				}
 				// The newest partial is kept even after the budget is spent: the
 				// provider may have buffered slightly ahead and those blocks are
@@ -270,13 +284,9 @@ function withReasoningLimits<TApi extends Api>(
 			return;
 		}
 
-		const message =
-			terminal?.type === "done" ? terminal.message : terminal?.type === "error" ? terminal.error : undefined;
-		if (!message) {
-			settleWithPartial("Provider stream ended without a terminal event");
-			return;
-		}
-		settle(message);
+		// A terminal event settles above; reaching here means the stream closed
+		// without naming an end, or the caller already settled it.
+		settleWithPartial("Provider stream ended without a terminal event");
 	})();
 
 	return stream;
