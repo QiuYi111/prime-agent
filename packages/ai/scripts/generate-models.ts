@@ -1586,6 +1586,84 @@ async function generateModels() {
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);
 
+	// Override the generic models.dev entry with the model's first-party Coding
+	// Plan contract; keep the fallback so a transient catalog lag cannot remove it.
+	const glm53Flash: Model<"openai-completions"> = {
+		id: "glm-5.3-flash",
+		name: "GLM-5.3-Flash",
+		api: "openai-completions",
+		provider: "zai",
+		baseUrl: "https://api.z.ai/api/coding/paas/v4",
+		compat: {
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			thinkingFormat: "zai-preserved",
+			zaiToolStream: true,
+		},
+		reasoning: true,
+		thinkingLevelMap: {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: "max",
+		},
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000000,
+		maxTokens: 131072,
+	};
+	const existingGlm53Flash = allModels.findIndex(
+		(model) => model.provider === glm53Flash.provider && model.id === glm53Flash.id,
+	);
+	if (existingGlm53Flash >= 0) allModels[existingGlm53Flash] = glm53Flash;
+	else allModels.push(glm53Flash);
+
+	// The user's Qwen Token Plan key is only accepted by the Token Plan
+	// OpenAI-compatible endpoint (not DashScope's pay-as-you-go endpoint).
+	// qwen3.8-max also requires replaying reasoning_content during tool use.
+	const dashscopeBaseUrl = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+	const dashscopeQwenModels = [
+		["qwen3.8-max", "Qwen3.8-Max", 1000000, 131072],
+		["qwen3.7-max", "Qwen3.7-Max", 1000000, 65536],
+		["qwen3.7-plus", "Qwen3.7-Plus", 1000000, 65536],
+		["qwen3.7-flash", "Qwen3.7-Flash", 1000000, 65536],
+	] as const;
+	for (const [id, name, contextWindow, maxTokens] of dashscopeQwenModels) {
+		const isQwen38Max = id === "qwen3.8-max";
+		allModels.push({
+			id,
+			name,
+			api: "openai-completions",
+			provider: "dashscope",
+			baseUrl: dashscopeBaseUrl,
+			compat: {
+				supportsDeveloperRole: false,
+				maxTokensField: "max_completion_tokens",
+				thinkingFormat: "qwen",
+				...(isQwen38Max
+					? {
+						supportsReasoningEffort: true,
+						preserveThinking: true,
+						requiresReasoningContentOnAssistantMessages: true,
+					}
+					: {}),
+			},
+			reasoning: true,
+			thinkingLevelMap: isQwen38Max
+				? { off: "off", minimal: "low", low: "low", medium: "medium", high: "medium", xhigh: "xhigh", max: "xhigh" }
+				: undefined,
+			// The curated models are native vision-language models; Pi's image
+			// blocks map directly to DashScope's OpenAI-compatible image_url blocks.
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow,
+			maxTokens,
+		});
+	}
+
 	// Fix incorrect cache pricing for Claude Opus 4.5 from models.dev
 	// models.dev has 3x the correct pricing (1.5/18.75 instead of 0.5/6.25)
 	const opus45 = allModels.find(m => m.provider === "anthropic" && m.id === "claude-opus-4-5");

@@ -993,6 +993,46 @@ describe("openai-completions tool_choice", () => {
 		expect((payload as { reasoning?: unknown }).reasoning).toEqual({ effort: "high" });
 	});
 
+	it("uses preserved always-on thinking for GLM-5.3-Flash", async () => {
+		const model = getModel("zai", "glm-5.3-flash")!;
+		let payload: unknown;
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{
+				apiKey: "test",
+				reasoning: "high",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		expect((payload as { enable_thinking?: unknown }).enable_thinking).toBeUndefined();
+		expect((payload as { thinking?: unknown }).thinking).toEqual({ type: "enabled", clear_thinking: false });
+		expect((payload as { reasoning_effort?: unknown }).reasoning_effort).toBe("high");
+	});
+
+	it("serializes DashScope Qwen3.8-Max thinking controls", async () => {
+		const model = getModel("dashscope", "qwen3.8-max")!;
+		let payload: unknown;
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{
+				apiKey: "test",
+				reasoning: "high",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		expect((payload as { enable_thinking?: unknown }).enable_thinking).toBe(true);
+		expect((payload as { reasoning_effort?: unknown }).reasoning_effort).toBe("medium");
+		expect((payload as { preserve_thinking?: unknown }).preserve_thinking).toBe(true);
+	});
+
 	it("uses enabled toggles when an OpenRouter model has no effort selector", async () => {
 		const baseModel = getModel("openrouter", "deepseek/deepseek-r1")!;
 		const model = {

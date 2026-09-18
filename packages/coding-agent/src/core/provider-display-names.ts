@@ -6,6 +6,7 @@ export const BUILT_IN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
 	"cloudflare-ai-gateway": "Cloudflare AI Gateway",
 	"cloudflare-workers-ai": "Cloudflare Workers AI",
 	deepseek: "DeepSeek",
+	dashscope: "Alibaba Cloud Model Studio Token Plan",
 	fireworks: "Fireworks",
 	google: "Google Gemini",
 	"google-vertex": "Google Vertex AI",

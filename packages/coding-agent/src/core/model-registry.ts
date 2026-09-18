@@ -20,13 +20,13 @@ import {
 	resetApiProviders,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
-import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
+import { registerBuiltinMcpOAuthProviders } from "../../../ai/dist/mcp.js";
+import { registerOAuthProvider, resetOAuthProviders } from "../../../ai/dist/oauth.js";
 import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
@@ -114,6 +114,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 			Type.Literal("openrouter"),
 			Type.Literal("deepseek"),
 			Type.Literal("zai"),
+			Type.Literal("zai-preserved"),
 			Type.Literal("qwen"),
 			Type.Literal("qwen-chat-template"),
 		]),
@@ -123,6 +124,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
 	supportsStrictMode: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	preserveThinking: Type.Optional(Type.Boolean()),
 });
 
 const OpenAIResponsesCompatSchema = Type.Object({

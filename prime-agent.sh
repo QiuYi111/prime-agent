@@ -33,6 +33,7 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset XAI_API_KEY
   unset OPENROUTER_API_KEY
   unset ZAI_API_KEY
+	unset DASHSCOPE_API_KEY
   unset MISTRAL_API_KEY
   unset MINIMAX_API_KEY
   unset MINIMAX_CN_API_KEY

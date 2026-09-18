@@ -143,6 +143,43 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it("treats an explicit prompt after abort as a resume signal", async () => {
+		const session = createFakeSession("resume-after-abort", []);
+		let suspended = true;
+		const resumeQueuedWork = vi.fn(() => {
+			suspended = false;
+		});
+		const prompt = vi.fn((_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(true);
+			return Promise.resolve();
+		});
+		Object.defineProperty(session.session, "isQueuedWorkSuspended", { get: () => suspended });
+		Object.assign(session.session, { resumeQueuedWork, prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.prompt("continue");
+
+		expect(resumeQueuedWork).toHaveBeenCalledOnce();
+		expect(prompt).toHaveBeenCalledOnce();
+	});
+
+	it("leaves the session ready for input after an RPC abort", async () => {
+		const session = createFakeSession("abort-ready", []);
+		const clearQueue = vi.fn();
+		const requestAbort = vi.fn();
+		const waitForIdle = vi.fn().mockResolvedValue(undefined);
+		const resumeQueuedWork = vi.fn();
+		Object.assign(session.session, { clearQueue, requestAbort, waitForIdle, resumeQueuedWork });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await connection.abort();
+
+		expect(clearQueue).toHaveBeenCalledOnce();
+		expect(requestAbort).toHaveBeenCalledOnce();
+		expect(waitForIdle).toHaveBeenCalledOnce();
+		expect(resumeQueuedWork).toHaveBeenCalledOnce();
+	});
+
 	it.each([
 		{ accepted: true, promptResult: "pending", expectedError: undefined },
 		{ accepted: false, promptResult: "resolve", expectedError: "Prompt was not accepted by the session." },

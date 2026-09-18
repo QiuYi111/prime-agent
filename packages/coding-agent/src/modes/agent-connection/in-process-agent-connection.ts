@@ -333,6 +333,9 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
+		// abort() suspends queued input so stale follow-ups cannot restart a run.
+		// A new explicit prompt is the user's resume signal.
+		if (this.session.isQueuedWorkSuspended) this.session.resumeQueuedWork();
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			let accepted = false;
@@ -369,6 +372,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
+		if (this.session.isQueuedWorkSuspended) this.session.resumeQueuedWork();
 		await this.session.promptAndWait(message, {
 			...(options?.images ? { images: options.images } : {}),
 			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
@@ -418,7 +422,12 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
+		// RPC abort is an explicit user action: discard stale queued turns, stop
+		// the active turn, then immediately reopen admission for the next input.
+		this.session.clearQueue();
 		this.session.requestAbort();
+		await this.session.waitForIdle();
+		this.session.resumeQueuedWork();
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
