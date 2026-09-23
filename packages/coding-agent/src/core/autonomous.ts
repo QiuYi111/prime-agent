@@ -98,6 +98,7 @@ interface GitWorktreeSnapshot {
 
 interface AutonomousOperationOptions {
 	cwd?: string;
+	env?: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
 }
 
@@ -278,13 +279,14 @@ export async function refreshAutonomousQualityGates(
 	if (!state.enabled || state.gates.commands.length === 0) {
 		return undefined;
 	}
-	return await runAutonomousQualityGates(state, options.cwd, options.signal);
+	return await runAutonomousQualityGates(state, options.cwd, options.signal, options.env);
 }
 
 async function runAutonomousQualityGates(
 	state: AutonomousRuntimeState,
 	cwd: string | undefined,
 	signal: AbortSignal | undefined,
+	env: NodeJS.ProcessEnv | undefined,
 ): Promise<AutonomousGateResult> {
 	signal?.throwIfAborted();
 	if (!cwd) {
@@ -314,6 +316,7 @@ async function runAutonomousQualityGates(
 			shell: true,
 			timeoutMs: state.gates.timeoutMs,
 			maxOutputChars: MAX_GATE_OUTPUT_CHARS,
+			env,
 			signal,
 		});
 		signal?.throwIfAborted();
@@ -486,6 +489,7 @@ function runChildProcess(
 		shell?: boolean;
 		timeoutMs?: number;
 		maxOutputChars?: number;
+		env?: NodeJS.ProcessEnv;
 		signal?: AbortSignal;
 	} = {},
 ): Promise<ChildProcessResult> {
@@ -495,6 +499,7 @@ function runChildProcess(
 			cwd: options.cwd,
 			detached: process.platform !== "win32",
 			shell: options.shell === true,
+			env: options.env ? { ...process.env, ...options.env } : process.env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		if (child.pid) {
