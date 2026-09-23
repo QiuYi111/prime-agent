@@ -242,6 +242,21 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
 	});
 
+	it("runs autonomous gates with the owning Prime session identity", async () => {
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				gates: { commands: [`${process.execPath} -e "require('node:fs').writeFileSync('gate-session-id.txt', (process.env.PRIME_AGENT_SESSION_ID || '') + ':' + (process.env.PI_CAD_SESSION_ID || ''))"`] },
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("Done.")]);
+
+		await harness.session.prompt("make the change");
+
+		expect(readFileSync(join(harness.tempDir, "gate-session-id.txt"), "utf8")).toBe(`${harness.sessionManager.getSessionId()}:${harness.sessionManager.getSessionId()}`);
+	});
+
 	it("feeds failing autonomous gate output back into the session", async () => {
 		const harness = await createHarness({
 			autonomous: {

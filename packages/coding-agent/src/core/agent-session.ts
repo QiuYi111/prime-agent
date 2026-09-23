@@ -2776,6 +2776,7 @@ export class AgentSession {
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
 			cwd: this._cwd,
+			env: { PRIME_AGENT_SESSION_ID: this.sessionId, PI_CAD_SESSION_ID: this.sessionId },
 			signal: this.agent.signal,
 		});
 		if (!autonomousMessage) {
@@ -3337,6 +3338,7 @@ export class AgentSession {
 		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
 			cwd: this._cwd,
+			env: { PRIME_AGENT_SESSION_ID: this.sessionId, PI_CAD_SESSION_ID: this.sessionId },
 			signal,
 		});
 		if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
@@ -4282,6 +4284,7 @@ export class AgentSession {
 	async refreshAutonomousGates(): Promise<void> {
 		await refreshAutonomousQualityGates(this._autonomousState, {
 			cwd: this._cwd,
+			env: { PRIME_AGENT_SESSION_ID: this.sessionId, PI_CAD_SESSION_ID: this.sessionId },
 		});
 	}
 
