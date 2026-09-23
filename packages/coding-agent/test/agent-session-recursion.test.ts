@@ -465,6 +465,11 @@ describe("AgentSession rlm recursion", () => {
 		const header = JSON.parse(readFileSync(child.sessionFile, "utf8").split("\n")[0] ?? "{}");
 		expect(header).toMatchObject({ parentSession: root.sessionFile, rlmDepth: 3 });
 		expect(child.rlmDepth).toBe(3);
+		const parentKernelEnv = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		const childKernelEnv = (child as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		expect(parentKernelEnv.PRIME_AGENT_SESSION_ID).toBe(root.sessionId);
+		expect(childKernelEnv.PRIME_AGENT_SESSION_ID).toBe(child.sessionId);
+		expect(childKernelEnv.PRIME_AGENT_SESSION_ID).not.toBe(parentKernelEnv.PRIME_AGENT_SESSION_ID);
 	});
 
 	it("lets the orchestrator choose a unique subagent session name", async () => {
@@ -4355,6 +4360,7 @@ describe("AgentSession RLM session dir", () => {
 		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
 		expect(inspectable._rlmKernelEnv().RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
 		expect(inspectable._rlmKernelEnv().RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
+		expect(inspectable._rlmKernelEnv().PRIME_AGENT_SESSION_ID).toBe(sessionManager.getSessionId());
 	});
 
 	it("points RLM_HARNESS_STATE_DIR at the session's own artifact dir for subagent sessions", () => {
@@ -4372,6 +4378,7 @@ describe("AgentSession RLM session dir", () => {
 		const env = inspectable._rlmKernelEnv();
 		expect(env.RLM_SESSION_DIR).toBe(subDir);
 		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
+		expect(env.PRIME_AGENT_SESSION_ID).toBe(sessionManager.getSessionId());
 	});
 
 	it("falls back to the rlm session dir for RLM_HARNESS_STATE_DIR without an artifact dir", () => {

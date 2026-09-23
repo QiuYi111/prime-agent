@@ -9200,6 +9200,9 @@ export class AgentSession {
 			RLM_DEPTH: String(this._rlmDepth),
 			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
 			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
+			// Bind kernel requests to the conversation that owns this kernel. Inline
+			// subagents create their own AgentSession and therefore get their own ID.
+			PRIME_AGENT_SESSION_ID: this.sessionId,
 		};
 		const rlmSessionDir = this._ensureRlmSessionDir();
 		if (rlmSessionDir) {
