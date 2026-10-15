@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly expected_reify_revision="e0b453f90fe1a839f8cf1090ac18f46bf6057668"
+readonly default_reify_revision="e0b453f90fe1a839f8cf1090ac18f46bf6057668"
 reify_root="${1:-${PI_CAD_TEST_REIFY_ROOT:-}}"
+expected_reify_revision="${2:-${PI_CAD_EXPECTED_REIFY_REVISION:-$default_reify_revision}}"
 
 if [[ -z "$reify_root" ]]; then
-	echo "Usage: $0 /path/to/pi-cad (must be clean at $expected_reify_revision)" >&2
+	echo "Usage: $0 /path/to/pi-cad [expected-reify-commit]" >&2
+	exit 2
+fi
+if [[ ! "$expected_reify_revision" =~ ^[0-9a-f]{40}$ ]]; then
+	echo "Expected Reify revision must be a full 40-character commit hash." >&2
 	exit 2
 fi
 if [[ ! -d "$reify_root" ]]; then
