@@ -15,7 +15,7 @@ fi
 reify_root="$(cd -- "$reify_root" && pwd -P)"
 
 if [[ "$(uname -s)" != Linux ]]; then
-	echo "This integration test requires Linux (bubblewrap and Unix sockets)." >&2
+	echo "This integration test requires Linux and Unix sockets." >&2
 	exit 2
 fi
 if [[ ! -f "$reify_root/package.json" || ! -f "$reify_root/src/authority/sidecar.ts" ]]; then
