@@ -39,6 +39,7 @@ import {
 	formatThrownValue,
 } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { shortHash } from "../utils/hash.js";
 import { headersToRecord } from "../utils/headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -84,6 +85,11 @@ interface RequestBody {
 	text?: { verbosity?: string };
 	include?: string[];
 	prompt_cache_key?: string;
+	prompt_cache_options?: {
+		mode?: "implicit" | "explicit";
+		ttl?: "30m";
+		comparison_response_id?: string;
+	};
 	[key: string]: unknown;
 }
 
@@ -146,6 +152,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
+			const promptCacheRequestDiagnostic = buildPromptCacheRequestDiagnostic(options?.sessionId, body);
+			if (promptCacheRequestDiagnostic) {
+				appendAssistantMessageDiagnostic(output, promptCacheRequestDiagnostic);
+			}
 			const websocketRequestId = options?.sessionId || createCodexRequestId();
 			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
 			const websocketHeaders = buildWebSocketHeaders(
@@ -181,6 +191,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					if (options?.signal?.aborted) {
 						throw new Error("Request was aborted");
 					}
+					rememberPromptCacheRequest(options?.sessionId, body);
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -203,7 +214,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
 						}),
 					);
-					recordWebSocketFailure(options?.sessionId, error);
+					recordWebSocketFailure(options?.sessionId, error, !websocketStarted);
 					if (websocketStarted) {
 						throw error;
 					}
@@ -278,6 +289,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
+			rememberPromptCacheRequest(options?.sessionId, body);
 
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -321,9 +333,8 @@ function buildRequestBody(
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): RequestBody {
-	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
-		includeSystemPrompt: false,
-	});
+	const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS);
 
 	const body: RequestBody = {
 		model: model.id,
@@ -333,7 +344,7 @@ function buildRequestBody(
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
-		prompt_cache_key: options?.sessionId,
+		prompt_cache_key: cacheSessionId,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};
@@ -364,6 +375,14 @@ function buildRequestBody(
 	}
 
 	return body;
+}
+
+function isGpt56OrLater(modelId: string): boolean {
+	const match = /^gpt-(\d+)\.(\d+)/.exec(modelId);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 5 || (major === 5 && minor >= 6);
 }
 
 // Multipliers per https://developers.openai.com/api/docs/pricing (retrieved 2026-08-21)
@@ -600,6 +619,81 @@ export interface OpenAICodexWebSocketDebugStats {
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
+const promptCacheRequestSnapshots = new Map<string, PromptCacheRequestSnapshot>();
+
+interface PromptCacheRequestSnapshot {
+	modelConfigHash: string;
+	systemHash: string;
+	toolsHash: string;
+	inputItemHashes: string[];
+}
+
+function hashPromptCacheValue(value: unknown): string {
+	return shortHash(JSON.stringify(value));
+}
+
+function buildPromptCacheRequestSnapshot(body: RequestBody): PromptCacheRequestSnapshot {
+	const input = body.input ?? [];
+	const systemItems = input.filter((item) => "role" in item && (item.role === "developer" || item.role === "system"));
+	const { input: _input, tools: _tools, instructions: _instructions, prompt_cache_options, ...config } = body;
+	const { comparison_response_id: _comparisonResponseId, ...stablePromptCacheOptions } = prompt_cache_options ?? {};
+	return {
+		modelConfigHash: hashPromptCacheValue({ ...config, prompt_cache_options: stablePromptCacheOptions }),
+		systemHash: hashPromptCacheValue({ instructions: body.instructions, systemItems }),
+		toolsHash: hashPromptCacheValue(body.tools ?? []),
+		inputItemHashes: input.map(hashPromptCacheValue),
+	};
+}
+
+function buildPromptCacheRequestDiagnostic(
+	sessionId: string | undefined,
+	body: RequestBody,
+): ReturnType<typeof createAssistantMessageDiagnostic> | undefined {
+	if (!sessionId || !isGpt56OrLater(body.model)) return undefined;
+	const current = buildPromptCacheRequestSnapshot(body);
+	const previous = promptCacheRequestSnapshots.get(sessionId);
+	let changedComponent = "first_request";
+	let firstDifferentInputItem: number | null = null;
+	let previousInputIsPrefix: boolean | null = null;
+
+	if (previous) {
+		if (previous.modelConfigHash !== current.modelConfigHash) changedComponent = "model_or_config";
+		else if (previous.toolsHash !== current.toolsHash) changedComponent = "tools";
+		else if (previous.systemHash !== current.systemHash) changedComponent = "system";
+		else {
+			const commonLength = Math.min(previous.inputItemHashes.length, current.inputItemHashes.length);
+			for (let index = 0; index < commonLength; index++) {
+				if (previous.inputItemHashes[index] !== current.inputItemHashes[index]) {
+					firstDifferentInputItem = index;
+					break;
+				}
+			}
+			previousInputIsPrefix =
+				firstDifferentInputItem === null && previous.inputItemHashes.length <= current.inputItemHashes.length;
+			changedComponent = previousInputIsPrefix ? "append_only" : "input";
+		}
+	}
+
+	return {
+		type: "prompt_cache_request",
+		timestamp: Date.now(),
+		details: {
+			changedComponent,
+			firstDifferentInputItem,
+			previousInputIsPrefix,
+			previousInputItems: previous?.inputItemHashes.length ?? 0,
+			currentInputItems: current.inputItemHashes.length,
+			modelConfigHash: current.modelConfigHash,
+			systemHash: current.systemHash,
+			toolsHash: current.toolsHash,
+			toolOrder: (body.tools ?? []).map((tool) => ("name" in tool ? tool.name : tool.type)),
+		},
+	};
+}
+
+function rememberPromptCacheRequest(sessionId: string | undefined, body: RequestBody): void {
+	if (sessionId) promptCacheRequestSnapshots.set(sessionId, buildPromptCacheRequestSnapshot(body));
+}
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
 	let stats = websocketDebugStats.get(sessionId);
@@ -645,12 +739,14 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		const entry = websocketSessionCache.get(sessionId);
 		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
+		promptCacheRequestSnapshots.delete(sessionId);
 		return;
 	}
 	for (const entry of websocketSessionCache.values()) {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+	promptCacheRequestSnapshots.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -666,14 +762,18 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown, activateFallback: boolean): void {
 	if (!sessionId) return;
-	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
 	stats.lastWebSocketError = formatThrownValue(error);
-	stats.websocketFallbackActive = true;
+	// A mid-stream 1006 can be a transient network drop. Retry with a fresh
+	// WebSocket on the next turn, then pin the session to SSE if it repeats.
+	if (activateFallback || stats.websocketFailures >= 2) {
+		websocketSseFallbackSessions.add(sessionId);
+	}
+	stats.websocketFallbackActive = websocketSseFallbackSessions.has(sessionId);
 }
 
 type WebSocketConstructor = new (
@@ -1038,11 +1138,15 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 
 function requestBodyWithoutInput(body: RequestBody): RequestBody {
 	const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
-	return rest;
+	if (!rest.prompt_cache_options?.comparison_response_id) return rest;
+	const { comparison_response_id: _comparisonResponseId, ...promptCacheOptions } = rest.prompt_cache_options;
+	return { ...rest, prompt_cache_options: promptCacheOptions };
 }
 
 function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | undefined): boolean {
-	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+	const withoutCacheMetadata = (input: ResponseInput | undefined) =>
+		JSON.stringify(input ?? [], (key, value) => (key === "prompt_cache_breakpoint" ? undefined : value));
+	return withoutCacheMetadata(a) === withoutCacheMetadata(b);
 }
 
 function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {

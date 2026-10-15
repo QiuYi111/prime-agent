@@ -1,0 +1,1 @@
+- Added an extension API for typed requests from Python skills to the existing kernel host bridge.

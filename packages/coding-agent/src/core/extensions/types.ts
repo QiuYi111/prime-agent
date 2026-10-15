@@ -286,6 +286,8 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Immutable Prime session identity for this extension context. This value comes from the host session manager, never from kernel request data. */
+	readonly sessionId: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
@@ -308,6 +310,21 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+}
+
+export type KernelHostRequestHandler = (
+	payload: Record<string, unknown>,
+	ctx: ExtensionContext,
+) => Promise<Record<string, unknown>> | Record<string, unknown>;
+
+/** Typed request handled by the TypeScript host on behalf of kernel code. */
+export interface KernelHostRequestRegistration {
+	type: string;
+	handler: KernelHostRequestHandler;
+}
+
+export interface RegisteredKernelHostRequest extends KernelHostRequestRegistration {
+	sourceInfo: SourceInfo;
 }
 
 /**
@@ -1037,6 +1054,8 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+	/** Register a typed request handled by the host for code running in the session kernel. */
+	registerKernelHostRequest(registration: KernelHostRequestRegistration): void;
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 
@@ -1417,6 +1436,7 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	kernelHostRequests?: Map<string, RegisteredKernelHostRequest>;
 }
 
 /** Result of loading extensions. */

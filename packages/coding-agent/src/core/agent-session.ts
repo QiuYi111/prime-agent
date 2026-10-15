@@ -9160,6 +9160,17 @@ export class AgentSession {
 		if (this._mcpManager) {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
+		for (const extension of this._resourceLoader.getExtensions().extensions) {
+			for (const registration of extension.kernelHostRequests?.values() ?? []) {
+				if (handlers[registration.type]) {
+					throw new Error(
+						`Kernel host request type ${registration.type} from ${registration.sourceInfo.path} conflicts with an existing handler`,
+					);
+				}
+				handlers[registration.type] = async (payload) =>
+					registration.handler(payload, this._extensionRunner.createContext());
+			}
+		}
 		return handlers;
 	}
 

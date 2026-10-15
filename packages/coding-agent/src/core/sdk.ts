@@ -92,6 +92,8 @@ export type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
+	KernelHostRequestHandler,
+	KernelHostRequestRegistration,
 	SlashCommandInfo,
 	SlashCommandSource,
 	ToolDefinition,

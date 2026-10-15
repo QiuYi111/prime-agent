@@ -595,6 +595,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.sessionManager;
 			},
+			get sessionId() {
+				runner.assertActive();
+				return runner.sessionManager.getSessionId();
+			},
 			get modelRegistry() {
 				runner.assertActive();
 				return runner.modelRegistry;

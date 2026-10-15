@@ -57,6 +57,8 @@ export {
 	ExtensionRunner,
 	type ExtensionShortcut,
 	type ExtensionUIContext,
+	type KernelHostRequestHandler,
+	type KernelHostRequestRegistration,
 	type LoadExtensionsResult,
 	type MessageRenderer,
 	type RegisteredCommand,

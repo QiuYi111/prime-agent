@@ -74,6 +74,7 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	promptCacheBreakpoints?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -118,9 +119,12 @@ export function convertResponsesMessages<TApi extends Api>(
 	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
 	if (includeSystemPrompt && context.systemPrompt) {
 		const role = model.reasoning ? "developer" : "system";
+		const promptContent = options?.promptCacheBreakpoints
+			? buildPromptCacheableSystemContent(sanitizeSurrogates(context.systemPrompt))
+			: sanitizeSurrogates(context.systemPrompt);
 		messages.push({
 			role,
-			content: sanitizeSurrogates(context.systemPrompt),
+			content: promptContent,
 		});
 	}
 
@@ -236,8 +240,15 @@ export function convertResponsesMessages<TApi extends Api>(
 						});
 					}
 				}
+				if (options?.promptCacheBreakpoints && contentParts.length > 0) {
+					(contentParts.at(-1) as CacheableResponseInputContent).prompt_cache_breakpoint = {
+						mode: "explicit",
+					};
+				}
 
 				output = contentParts;
+			} else if (options?.promptCacheBreakpoints && hasText) {
+				output = [cacheableInputText(sanitizeSurrogates(textResult))];
 			} else {
 				output = sanitizeSurrogates(hasText ? textResult : hasImages ? "(see attached image)" : "");
 			}
@@ -251,7 +262,53 @@ export function convertResponsesMessages<TApi extends Api>(
 		msgIndex++;
 	}
 
+	if (options?.promptCacheBreakpoints) {
+		addConversationPromptCacheBreakpoints(messages);
+	}
+
 	return messages;
+}
+
+type CacheableResponseInputText = ResponseInputText & {
+	prompt_cache_breakpoint?: { mode: "explicit" };
+};
+type CacheableResponseInputContent = ResponseFunctionCallOutputItemList[number] & {
+	prompt_cache_breakpoint?: { mode: "explicit" };
+};
+
+const CONTINUAL_HARNESS_HEADING = "# Continual Harness State";
+
+function cacheableInputText(text: string): CacheableResponseInputText {
+	return { type: "input_text", text, prompt_cache_breakpoint: { mode: "explicit" } };
+}
+
+function buildPromptCacheableSystemContent(systemPrompt: string): CacheableResponseInputText[] {
+	const harnessStart = systemPrompt.indexOf(CONTINUAL_HARNESS_HEADING);
+	if (harnessStart <= 0) return [cacheableInputText(systemPrompt)];
+
+	// Refinement changes the continual harness suffix. A boundary immediately
+	// before it preserves the tools + base prompt prefix across that update, while
+	// the second boundary caches the complete current system prompt.
+	return [
+		cacheableInputText(systemPrompt.slice(0, harnessStart)),
+		cacheableInputText(systemPrompt.slice(harnessStart)),
+	];
+}
+
+/**
+ * Mark each user message when it first enters the request. The markers must be
+ * deterministic: adding a marker to an older item on a later round would mutate
+ * the serialized prefix and defeat the cache. GPT-5.6 implicit mode writes the
+ * latest implicit checkpoint plus up to the latest three explicit checkpoints.
+ */
+function addConversationPromptCacheBreakpoints(messages: ResponseInput): void {
+	for (const item of messages) {
+		if (!("role" in item) || item.role !== "user" || !Array.isArray(item.content)) continue;
+		const content = item.content.at(-1);
+		if (content) {
+			(content as CacheableResponseInputContent).prompt_cache_breakpoint = { mode: "explicit" };
+		}
+	}
 }
 
 export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
@@ -476,15 +533,28 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			if (response?.usage) {
 				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+				const cacheWriteTokens = response.usage.input_tokens_details?.cache_write_tokens || 0;
 				output.usage = {
-					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
-					input: (response.usage.input_tokens || 0) - cachedTokens,
+					// OpenAI includes cache reads and writes in input_tokens.
+					input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
 					output: response.usage.output_tokens || 0,
 					cacheRead: cachedTokens,
-					cacheWrite: 0,
+					cacheWrite: cacheWriteTokens,
 					totalTokens: response.usage.total_tokens || 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};
+			}
+			const promptCacheDiagnostics = (response as unknown as { prompt_cache_diagnostics?: unknown })
+				.prompt_cache_diagnostics;
+			if (promptCacheDiagnostics !== undefined) {
+				output.diagnostics = [
+					...(output.diagnostics ?? []),
+					{
+						type: "prompt_cache",
+						timestamp: Date.now(),
+						details: { promptCacheDiagnostics },
+					},
+				];
 			}
 			calculateCost(model, output.usage);
 			if (options?.applyServiceTierPricing) {

@@ -409,6 +409,149 @@ describe("openai-codex streaming", () => {
 		await streamResult.result();
 	});
 
+	it("uses a stable GPT-5.6 cache key without fields rejected by the Codex backend", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-cache-"));
+		process.env.PI_CODING_AGENT_DIR = tempDir;
+		const token = mockToken();
+		const sessionId = "cache-session-56";
+		const requestBodies: Array<Record<string, any>> = [];
+		let responseNumber = 0;
+
+		global.fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
+				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
+			}
+			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
+			}
+			if (url !== "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response("not found", { status: 404 });
+			}
+
+			requestBodies.push(JSON.parse(String(init?.body)) as Record<string, any>);
+			responseNumber++;
+			const responseId = `resp_cache_${responseNumber}`;
+			const payload = `${[
+				`data: ${JSON.stringify({
+					type: "response.completed",
+					response: {
+						id: responseId,
+						status: "completed",
+						usage: {
+							input_tokens: 100,
+							output_tokens: 5,
+							total_tokens: 105,
+							input_tokens_details: { cached_tokens: 20, cache_write_tokens: 30 },
+						},
+						prompt_cache_diagnostics: { status: "miss", reusable_tokens: 80 },
+					},
+				})}`,
+				"data: [DONE]",
+			].join("\n\n")}\n\n`;
+			return new Response(payload, { status: 200, headers: { "content-type": "text/event-stream" } });
+		}) as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1.25 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "fixed system, tools, and skills\n\n# Continual Harness State\nmutable refinement",
+			messages: [
+				{ role: "user", content: "round one", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_cache|fc_cache", name: "cad.inspect", arguments: {} }],
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					model: "gpt-5.6-sol",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_cache|fc_cache",
+					toolName: "cad.inspect",
+					content: [{ type: "text", text: "11135" }],
+					isError: false,
+					timestamp: 3,
+				},
+				{ role: "user", content: "latest", timestamp: 3 },
+			],
+		};
+
+		const first = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId,
+			transport: "sse",
+		}).result();
+		const extendedContext: Context = {
+			...context,
+			messages: [...context.messages, { role: "user", content: "next round", timestamp: 4 }],
+		};
+		const second = await streamOpenAICodexResponses(model, extendedContext, {
+			apiKey: token,
+			sessionId,
+			transport: "sse",
+		}).result();
+		const toolsChanged = await streamOpenAICodexResponses(
+			model,
+			{
+				...extendedContext,
+				tools: [
+					{
+						name: "new_tool",
+						description: "A tool introduced during the session",
+						parameters: { type: "object", properties: {} } as any,
+					},
+				],
+			},
+			{ apiKey: token, sessionId, transport: "sse" },
+		).result();
+
+		expect(requestBodies[0].prompt_cache_key).toBe(sessionId);
+		expect(requestBodies[0].instructions).toBe(context.systemPrompt);
+		expect(requestBodies[0].prompt_cache_options).toBeUndefined();
+		const breakpoints = requestBodies[0].input
+			.flatMap((item: any) => (Array.isArray(item.content) ? item.content : []))
+			.filter((content: any) => content.prompt_cache_breakpoint);
+		expect(breakpoints).toHaveLength(0);
+		const toolResult = requestBodies[0].input.find((item: any) => item.type === "function_call_output");
+		expect(toolResult.output).toBe("11135");
+		expect(requestBodies[1].input.slice(0, requestBodies[0].input.length)).toEqual(requestBodies[0].input);
+		expect(first.usage).toMatchObject({ input: 50, cacheRead: 20, cacheWrite: 30, totalTokens: 105 });
+		expect(first.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache")?.details).toEqual({
+			promptCacheDiagnostics: { status: "miss", reusable_tokens: 80 },
+		});
+		expect(
+			second.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache_request")?.details,
+		).toMatchObject({
+			changedComponent: "append_only",
+			firstDifferentInputItem: null,
+			previousInputIsPrefix: true,
+		});
+		expect(
+			toolsChanged.diagnostics?.find((diagnostic) => diagnostic.type === "prompt_cache_request")?.details,
+		).toMatchObject({ changedComponent: "tools" });
+	});
+
 	it("preserves gpt-5.5 xhigh reasoning effort from simple options", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
@@ -859,7 +1002,7 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
-	it("sends only response input deltas in websocket-cached mode", async () => {
+	it("sends only response input deltas over a cached GPT-5.6 websocket", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];
 		const responses = [
@@ -952,8 +1095,8 @@ describe("openai-codex streaming", () => {
 		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
 
 		const model: Model<"openai-codex-responses"> = {
-			id: "gpt-5.1-codex",
-			name: "GPT-5.1 Codex",
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: "https://chatgpt.com/backend-api",
@@ -989,10 +1132,34 @@ describe("openai-codex streaming", () => {
 		const secondBody = sentBodies[1] as { input: unknown[]; previous_response_id?: string; store?: boolean };
 		expect(firstBody.store).toBe(false);
 		expect(firstBody.previous_response_id).toBeUndefined();
-		expect(firstBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Say hello" }] }]);
+		expect(firstBody.input).toEqual([
+			{
+				role: "developer",
+				content: "You are a helpful assistant.",
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "Say hello",
+					},
+				],
+			},
+		]);
 		expect(secondBody.store).toBe(false);
 		expect(secondBody.previous_response_id).toBe("resp_1");
-		expect(secondBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
+		expect(secondBody.input).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "Now finish",
+					},
+				],
+			},
+		]);
 		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
 			requests: 2,
 			connectionsCreated: 1,

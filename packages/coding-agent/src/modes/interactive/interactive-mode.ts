@@ -3081,11 +3081,13 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		const localSessionHost = this.getLocalSessionHost();
+		const sessionManager = localSessionHost.getSessionManager();
 		const createContext = (): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
 			hasUI: true,
 			cwd: this.getCurrentCwd(),
-			sessionManager: localSessionHost.getSessionManager(),
+			sessionId: sessionManager.getSessionId(),
+			sessionManager,
 			modelRegistry: this.modelRegistry,
 			model: this.getCurrentModel(),
 			isIdle: () => !this.isAgentStreaming(),

@@ -19,6 +19,7 @@ import type {
 	ExtensionAPI,
 	ExtensionFactory,
 	ExtensionRuntime,
+	KernelHostRequestRegistration,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
@@ -186,6 +187,20 @@ function createExtensionAPI(
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
+		},
+
+		registerKernelHostRequest(registration: KernelHostRequestRegistration): void {
+			runtime.assertActive();
+			if (!/^[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)+$/.test(registration.type)) {
+				throw new Error(`Invalid kernel host request type: ${registration.type}`);
+			}
+			if (extension.kernelHostRequests?.has(registration.type)) {
+				throw new Error(`Duplicate kernel host request type in ${extension.path}: ${registration.type}`);
+			}
+			extension.kernelHostRequests?.set(registration.type, {
+				...registration,
+				sourceInfo: extension.sourceInfo,
+			});
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
@@ -368,6 +383,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		kernelHostRequests: new Map(),
 	};
 }
 
