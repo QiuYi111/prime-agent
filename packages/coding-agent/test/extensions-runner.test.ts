@@ -424,6 +424,15 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("context creation", () => {
+		it("exposes the host session identity as a read-only context value", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const ctx = runner.createContext();
+
+			expect(ctx.sessionId).toBe(sessionManager.getSessionId());
+			expect(Object.getOwnPropertyDescriptor(ctx, "sessionId")?.set).toBeUndefined();
+		});
+
 		it("exposes the current abort signal on ExtensionContext", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);

@@ -286,6 +286,8 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Immutable Prime session identity for this extension context. This value comes from the host session manager, never from kernel request data. */
+	readonly sessionId: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
