@@ -1,4 +1,5 @@
-import { createReadStream, fstatSync } from "node:fs";
+import { fstatSync } from "node:fs";
+import { Socket } from "node:net";
 import type { Readable } from "node:stream";
 
 const SESSION_ISSUER_FD_ENV = "PI_CAD_SESSION_ISSUER_FD";
@@ -57,13 +58,13 @@ export async function consumeSessionIssuerBootstrap(environment: NodeJS.ProcessE
 		throw new Error("Prime session issuer bootstrap descriptor is invalid");
 	}
 
-	let input: ReturnType<typeof createReadStream> | undefined;
+	let input: Socket | undefined;
 	try {
 		const descriptorStat = fstatSync(fd);
 		if (!descriptorStat.isFIFO() && !descriptorStat.isSocket()) {
 			throw new Error("Prime session issuer bootstrap must be a pipe");
 		}
-		input = createReadStream(`/dev/fd/${fd}`, { fd, autoClose: true });
+		input = new Socket({ fd, readable: true, writable: false });
 		pendingSessionIssuerCapability = await readSessionIssuerBootstrapFrame(input, SESSION_ISSUER_READ_TIMEOUT_MS);
 	} finally {
 		input?.destroy();

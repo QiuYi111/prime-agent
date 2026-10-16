@@ -20,16 +20,16 @@ function runBootstrap(input: string | undefined): Promise<{ code: number | null;
 	`;
 	const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
 		cwd: process.cwd(),
-		env: { ...process.env, NODE_OPTIONS: "", PI_CAD_SESSION_ISSUER_FD: "3" },
-		stdio: ["ignore", "pipe", "pipe", "pipe"],
+		env: { ...process.env, NODE_OPTIONS: "", PI_CAD_SESSION_ISSUER_FD: "4" },
+		stdio: ["ignore", "pipe", "pipe", "ignore", "pipe"],
 	});
 	let stdout = "";
 	let stderr = "";
 	child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
 	child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
-	child.stdio[3]!.on("error", () => {});
-	if (input !== undefined) child.stdio[3]!.write(input);
-	child.stdio[3]!.end();
+	child.stdio[4]!.on("error", () => {});
+	if (input !== undefined) child.stdio[4]!.write(input);
+	child.stdio[4]!.end();
 	return new Promise((resolve, reject) => {
 		const timeout = setTimeout(() => {
 			child.kill("SIGKILL");
@@ -39,6 +39,40 @@ function runBootstrap(input: string | undefined): Promise<{ code: number | null;
 		child.once("exit", (code) => {
 			clearTimeout(timeout);
 			resolve({ code, stdout, stderr });
+		});
+	});
+}
+
+function runBootstrapWithHeldWriter(input?: string): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
+	const script = `
+		import { consumeSessionIssuerBootstrap } from ${JSON.stringify(bootstrapModule)};
+		try { await consumeSessionIssuerBootstrap(); }
+		catch (error) {
+			process.stderr.write(error instanceof Error ? error.message : String(error));
+			process.exitCode = 2;
+		}
+	`;
+	const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+		cwd: process.cwd(),
+		env: { ...process.env, NODE_OPTIONS: "", PI_CAD_SESSION_ISSUER_FD: "4" },
+		stdio: ["ignore", "pipe", "pipe", "ignore", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+	child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+	child.stdio[4]!.on("error", () => {});
+	if (input !== undefined) child.stdio[4]!.write(input);
+	const startedAt = Date.now();
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			child.kill("SIGKILL");
+			reject(new Error("bootstrap child stayed alive after its issuer deadline"));
+		}, 4_000);
+		child.once("error", reject);
+		child.once("exit", (code) => {
+			clearTimeout(timeout);
+			resolve({ code, stdout, stderr, elapsedMs: Date.now() - startedAt });
 		});
 	});
 }
@@ -65,6 +99,14 @@ describe("session issuer bootstrap", () => {
 		const pending = readSessionIssuerBootstrapFrame(input, 100);
 		await expect(pending).rejects.toThrow("bootstrap timed out");
 		expect(Date.now() - startedAt).toBeLessThan(1_000);
+	});
+
+	it.each([undefined, "A".repeat(7)])("exits on a held-open fd4 pipe after a missing or short frame", async (input) => {
+		const result = await runBootstrapWithHeldWriter(input);
+		expect(result.code).toBe(2);
+		expect(result.stderr).toContain("bootstrap timed out");
+		expect(result.stderr).not.toContain(testIssuer);
+		expect(result.elapsedMs).toBeLessThan(3_500);
 	});
 
 	it("does not persist the one-shot capability in worker descriptors", () => {
