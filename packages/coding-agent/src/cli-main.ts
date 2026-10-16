@@ -7,6 +7,8 @@ import {
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
 import { runRuntimeBootstrap } from "./cli/runtime-bootstrap.js";
+import { consumeSessionIssuerBootstrap } from "./cli/session-issuer-bootstrap.js";
+import { isDaemonWorkerProcess } from "./modes/daemon/daemon-worker-protocol.js";
 import { APP_NAME } from "./config.js";
 
 export async function runCli(): Promise<void> {
@@ -19,6 +21,7 @@ export async function runCli(): Promise<void> {
 	process.title = APP_NAME;
 	process.env.PI_CODING_AGENT = "true";
 	process.emitWarning = (() => {}) as typeof process.emitWarning;
+	if (!isDaemonWorkerProcess()) await consumeSessionIssuerBootstrap();
 
 	installOwnedSessionWorkerOwnerWatch();
 

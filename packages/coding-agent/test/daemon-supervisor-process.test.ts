@@ -325,6 +325,136 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
+	it("loads an explicitly configured extension in a fresh daemon worker", async () => {
+		if (process.platform === "win32") return;
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), "prime-supervisor-extension-" + process.pid + "-" + randomUUID().slice(0, 8) + ".sock");
+		const markerPath = join(root, "worker-extension-loaded.txt");
+		const extensionPath = join(root, "extension-probe.mjs");
+		mkdirSync(projectDir, { recursive: true });
+		const extensionSource =
+			'import { writeFileSync } from "node:fs"; writeFileSync(' +
+			JSON.stringify(markerPath) +
+			', "loaded"); export default function probe() {}';
+		writeFileSync(extensionPath, extensionSource, { encoding: "utf8" });
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, ["--extension", extensionPath]);
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true },
+		});
+		if (!created.success) throw new Error("Extension probe worker create failed: " + created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) throw new Error("Extension probe worker did not expose its process identity");
+		workerPids.add(summary.workerPid);
+		try {
+			await waitForCondition(() => existsSync(markerPath), "CLI-configured extension did not load in fresh worker");
+		} catch (error) {
+			throw new Error((error instanceof Error ? error.message : String(error)) + "\n" + readDaemonLogs(agentDir));
+		}
+		expect(readFileSync(markerPath, "utf8")).toBe("loaded");
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("hands a one-shot issuer to only the fresh worker and rejects reconnect replay", async () => {
+		if (process.platform === "win32") return;
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-issuer-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		const markerPath = join(root, "worker-issuer-result.json");
+		const extensionPath = join(root, "issuer-probe.mjs");
+		mkdirSync(projectDir, { recursive: true });
+		const issuer = "A".repeat(43);
+		writeFileSync(extensionPath, `
+			import { closeSync, existsSync, fstatSync, readSync, writeFileSync } from "node:fs";
+			import { createHash } from "node:crypto";
+			import { spawnSync } from "node:child_process";
+			const fd = Number(process.env.PI_CAD_SESSION_ISSUER_FD);
+			const fdStat = fstatSync(fd);
+			if (fd !== 4 || (!fdStat.isFIFO() && !fdStat.isSocket())) throw new Error("issuer descriptor was not mapped to worker fd4");
+			const issuerIdentity = fstatSync(fd);
+			const frame = Buffer.alloc(44);
+			let offset = 0;
+			const deadline = Date.now() + 2000;
+			while (offset < frame.length) {
+				try { offset += readSync(fd, frame, offset, frame.length - offset, null); }
+				catch (error) {
+					if (error.code !== "EAGAIN" && error.code !== "EWOULDBLOCK") throw error;
+					if (Date.now() >= deadline) throw new Error("issuer frame timed out");
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+				}
+			}
+			closeSync(fd);
+			delete process.env.PI_CAD_SESSION_ISSUER_FD;
+			const workerFdClosed = !existsSync("/proc/self/fd/4");
+			if (frame[43] !== 10 || !/^[A-Za-z0-9_-]{43}$/.test(frame.subarray(0, 43).toString("ascii"))) throw new Error("issuer frame is invalid");
+			const child = spawnSync(process.execPath, ["-e", "const fs=require('node:fs');let sameIssuerPipe=false;try{const s=fs.fstatSync(4);sameIssuerPipe=s.dev===Number(process.argv[1])&&s.ino===Number(process.argv[2])}catch{};process.stdout.write(JSON.stringify({sameIssuerPipe,env:process.env.PI_CAD_SESSION_ISSUER_FD!==undefined}))", String(issuerIdentity.dev), String(issuerIdentity.ino)], { encoding: "utf8" });
+			writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({
+				bytes: offset,
+				issuerHash: createHash("sha256").update(frame.subarray(0, 43)).digest("hex"),
+				workerFdClosed,
+				workerEnvRemoved: process.env.PI_CAD_SESSION_ISSUER_FD === undefined,
+				child: JSON.parse(child.stdout),
+			}));
+			export default function issuerProbe() {}
+		`, { encoding: "utf8" });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, ["--extension", extensionPath]);
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			sessionIssuerCapability: issuer,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, extensions: [extensionPath] },
+		});
+		if (!created.success) throw new Error(`Issuer worker create failed: ${created.error}`);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.sessionFile) throw new Error("Issuer worker did not expose its session identity");
+		workerPids.add(summary.workerPid);
+		try {
+			await waitForCondition(() => existsSync(markerPath), "Fresh worker did not consume issuer fd4");
+		} catch (error) {
+			throw new Error(`${error instanceof Error ? error.message : String(error)}
+${readDaemonLogs(agentDir)}`);
+		}
+		const evidence = JSON.parse(readFileSync(markerPath, "utf8")) as {
+			bytes: number; issuerHash: string; workerFdClosed: boolean; workerEnvRemoved: boolean; child: { sameIssuerPipe: boolean; env: boolean };
+		};
+		expect(evidence.bytes).toBe(44);
+		expect(evidence.issuerHash).toBe(createHash("sha256").update(issuer).digest("hex"));
+		expect(evidence.workerFdClosed).toBe(true);
+		expect(evidence.workerEnvRemoved).toBe(true);
+		expect(evidence.child).toEqual({ sameIssuerPipe: false, env: false });
+
+		const descriptor = JSON.stringify(readWorkerDescriptor(agentDir));
+		const logs = readDaemonLogs(agentDir);
+		expect(descriptor).not.toContain(issuer);
+		expect(logs).not.toContain(issuer);
+		const secondClient = await connectEventually(socketPath);
+		const replay = await secondClient.request({
+			type: "create",
+			sessionIssuerCapability: issuer,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(replay).toMatchObject({ success: false });
+		if (!replay.success) expect(replay.error).toMatch(/already been consumed/);
+		expect(countWorkerDescriptors(agentDir)).toBe(1);
+		secondClient.close();
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
 	it("creates top-level sessions at depth zero when the supervisor inherits a child depth", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

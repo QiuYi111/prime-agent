@@ -22,6 +22,7 @@ import {
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
+import { takeSessionIssuerCapability } from "./cli/session-issuer-bootstrap.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
@@ -1091,8 +1092,14 @@ async function createDaemonClientConnection(options: {
 			}
 		}
 
-		const response = await client.request({
+		const sessionIssuerCapability =
+			!options.sessionPath && !options.continueRecent && !options.noSession ? takeSessionIssuerCapability() : undefined;
+		if (sessionIssuerCapability && !client.supportsServerCapability("session_issuer_bootstrap")) {
+			throw new Error("The running Prime Agent daemon cannot accept the session issuer bootstrap; restart it and retry");
+		}
+		const createCommand = {
 			type: "create",
+			...(sessionIssuerCapability ? { sessionIssuerCapability } : {}),
 			config: options.config,
 			sessionPath: options.sessionPath,
 			continueRecent: options.continueRecent,
@@ -1100,7 +1107,12 @@ async function createDaemonClientConnection(options: {
 			env: collectDaemonClientEnv(),
 			lifecycle: options.clientOwned ? "client_owned" : "resident",
 			launchEnv: collectDaemonLaunchEnv(),
-		});
+		} as const;
+		const response = await client.request(
+			createCommand,
+			undefined,
+			sessionIssuerCapability ? { recoverable: false } : {},
+		);
 		if (!response.success) {
 			throw deserializeDaemonCreateError(response);
 		}

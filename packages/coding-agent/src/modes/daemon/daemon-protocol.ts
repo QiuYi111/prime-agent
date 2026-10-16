@@ -122,7 +122,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "session_issuer_bootstrap";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -161,6 +162,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"owned_prompt_cancellation",
+	"session_issuer_bootstrap",
 	"queue_message_mutation",
 	"authoritative_child_roster",
 	"owned_session_recovery_context",
@@ -406,6 +408,8 @@ export type DaemonCommand =
 	| ({
 			id?: string;
 			type: "create";
+			/** One-shot launch capability; never written to worker descriptors or session files. */
+			sessionIssuerCapability?: string;
 			sessionPath?: string;
 			continueRecent?: boolean;
 			noSession?: boolean;

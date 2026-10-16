@@ -191,6 +191,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"agent_roster",
 	"direct_peer_transport",
+	"session_issuer_bootstrap",
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -544,7 +545,12 @@ function withoutCommandId(command: DaemonCommand): DaemonCommandBody {
 }
 
 function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCreateCommand {
-	const { launchEnv: _launchEnv, lifecycle: _lifecycle, ...workerCommand } = command;
+	const {
+		launchEnv: _launchEnv,
+		lifecycle: _lifecycle,
+		sessionIssuerCapability: _sessionIssuerCapability,
+		...workerCommand
+	} = command;
 	return workerCommand;
 }
 
@@ -728,6 +734,7 @@ export class DaemonSupervisor {
 	private readonly detachingInputPauseSessions = new WeakMap<DaemonSocketClient, Set<string>>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
+	private readonly consumedSessionIssuerCapabilityHashes = new Set<string>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/**
@@ -2893,6 +2900,21 @@ export class DaemonSupervisor {
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		if (command.sessionIssuerCapability !== undefined) {
+			if (
+				!/^[A-Za-z0-9_-]{43}$/.test(command.sessionIssuerCapability) ||
+				command.sessionPath !== undefined ||
+				command.continueRecent === true ||
+				command.noSession === true
+			) {
+				throw new Error("Session issuer is only valid for a fresh session create request");
+			}
+			const capabilityHash = createHash("sha256").update(command.sessionIssuerCapability).digest("hex");
+			if (this.consumedSessionIssuerCapabilityHashes.has(capabilityHash)) {
+				throw new Error("Session issuer capability has already been consumed by this supervisor");
+			}
+			this.consumedSessionIssuerCapabilityHashes.add(capabilityHash);
+		}
 		let createCommand = command;
 		if (command.name !== undefined) {
 			const normalizedName = command.name.trim();
@@ -2924,6 +2946,9 @@ export class DaemonSupervisor {
 			: `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		const pending = this.openingWorkers.get(key);
 		if (pending) {
+			if (command.sessionIssuerCapability !== undefined) {
+				throw new Error("Session issuer cannot be replayed into an existing worker launch");
+			}
 			return this.joinOpeningWorker(pending, ownerClientId, createCommand.sessionPath ?? key);
 		}
 		if (createCommand.sessionPath) {
@@ -3171,6 +3196,7 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+		const sessionIssuerCapability = command.sessionIssuerCapability;
 		const workerEnvironment = createCliSubprocessEnv({
 			...process.env,
 			...launchEnv,
@@ -3185,14 +3211,30 @@ export class DaemonSupervisor {
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
 		});
+		if (sessionIssuerCapability !== undefined) {
+			workerEnvironment.PI_CAD_SESSION_ISSUER_FD = "4";
+		} else {
+			delete workerEnvironment.PI_CAD_SESSION_ISSUER_FD;
+		}
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: workerEnvironment,
-			stdio: ["ignore", "ignore", "pipe", "pipe"],
+			stdio: ["ignore", "ignore", "pipe", "pipe", sessionIssuerCapability === undefined ? "ignore" : "pipe"],
 		});
+		if (sessionIssuerCapability !== undefined) {
+			const issuerPipe = child.stdio[4];
+			if (!(issuerPipe instanceof Writable)) {
+				child.kill("SIGTERM");
+				throw new Error("Session worker issuer channel could not be created");
+			}
+			issuerPipe.on("error", () => {
+				/* The worker exit reports a failed handoff; avoid an unhandled EPIPE. */
+			});
+			issuerPipe.end(`${sessionIssuerCapability}\n`);
+		}
 		const detachWorkerStderr = child.stderr
 			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
 					maxLineLength: 64 * 1024,
