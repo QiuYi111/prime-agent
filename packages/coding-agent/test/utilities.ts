@@ -165,6 +165,8 @@ export interface TestSessionOptions {
 	systemPrompt?: string;
 	/** Custom settings overrides */
 	settingsOverrides?: Record<string, unknown>;
+	/** Preloaded extensions for kernel host request integration tests. */
+	extensionsResult?: LoadExtensionsResult;
 }
 
 /**
@@ -263,7 +265,7 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader: createTestResourceLoader({ extensionsResult: options.extensionsResult }),
 	});
 
 	// Must subscribe to enable session persistence

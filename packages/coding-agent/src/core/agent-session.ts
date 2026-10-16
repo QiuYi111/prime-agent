@@ -154,6 +154,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import { createExtensionKernelHostHandlers } from "./extensions/kernel-host.js";
 import {
 	createGoalContextMessage,
 	emptyGoalState,
@@ -10514,7 +10515,11 @@ export class AgentSession {
 		if (this._mcpManager) {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
-		return handlers;
+		return createExtensionKernelHostHandlers(
+			this._resourceLoader.getExtensions().extensions,
+			(extensionPath) => this._extensionRunner.createContext(extensionPath),
+			handlers,
+		);
 	}
 
 	async reload(): Promise<void> {
