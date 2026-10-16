@@ -50,6 +50,8 @@ export {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
+	type KernelHostRequestHandler,
+	type KernelHostRequestRegistration,
 	type ExtensionError,
 	type ExtensionEvent,
 	type ExtensionFactory,
