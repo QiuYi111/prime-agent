@@ -2900,20 +2900,15 @@ export class DaemonSupervisor {
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		let sessionIssuerCapabilityHash: string | undefined;
 		if (command.sessionIssuerCapability !== undefined) {
 			if (
 				!/^[A-Za-z0-9_-]{43}$/.test(command.sessionIssuerCapability) ||
-				command.sessionPath !== undefined ||
-				command.continueRecent === true ||
 				command.noSession === true
 			) {
-				throw new Error("Session issuer is only valid for a fresh session create request");
+				throw new Error("Session issuer is only valid for a persisted session create request");
 			}
-			const capabilityHash = createHash("sha256").update(command.sessionIssuerCapability).digest("hex");
-			if (this.consumedSessionIssuerCapabilityHashes.has(capabilityHash)) {
-				throw new Error("Session issuer capability has already been consumed by this supervisor");
-			}
-			this.consumedSessionIssuerCapabilityHashes.add(capabilityHash);
+			sessionIssuerCapabilityHash = createHash("sha256").update(command.sessionIssuerCapability).digest("hex");
 		}
 		let createCommand = command;
 		if (command.name !== undefined) {
@@ -2930,6 +2925,7 @@ export class DaemonSupervisor {
 				activeMatches.length === 1 &&
 				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
 			) {
+				if (sessionIssuerCapabilityHash) throw new Error("Session issuer cannot be attached to an existing worker");
 				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
 			}
 			if (activeMatches.length > 1) {
@@ -2954,6 +2950,7 @@ export class DaemonSupervisor {
 		if (createCommand.sessionPath) {
 			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
+				if (sessionIssuerCapabilityHash) throw new Error("Session issuer cannot be attached to an existing worker");
 				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
 			}
 			// The reclaim await may have let a concurrent opener register; join it instead of double-launching.
@@ -2965,11 +2962,21 @@ export class DaemonSupervisor {
 		if (createCommand.sessionPath) {
 			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
+				if (sessionIssuerCapabilityHash) throw new Error("Session issuer cannot be attached to an existing worker");
 				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
 			}
 		}
+		const launchNewWorker = () => {
+			if (sessionIssuerCapabilityHash) {
+				if (this.consumedSessionIssuerCapabilityHashes.has(sessionIssuerCapabilityHash)) {
+					throw new Error("Session issuer capability has already been consumed by this supervisor");
+				}
+				this.consumedSessionIssuerCapabilityHashes.add(sessionIssuerCapabilityHash);
+			}
+			return this.launchWorker(createCommand, undefined, ownerClientId);
+		};
 		const opening = (async () => {
-			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
+			if (!createCommand.name) return launchNewWorker();
 			const savedSiblings = createCommand.sessionPath ? await this.rlmLedgerSiblings(createCommand.sessionPath) : [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
@@ -2982,7 +2989,7 @@ export class DaemonSupervisor {
 				} else {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
-				return this.launchWorker(createCommand, undefined, ownerClientId);
+				return launchNewWorker();
 			});
 		})();
 		this.openingWorkers.set(key, opening);

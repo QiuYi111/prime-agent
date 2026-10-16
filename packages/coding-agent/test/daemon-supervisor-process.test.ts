@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -363,7 +364,7 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
-	it("hands a one-shot issuer to only the fresh worker and rejects reconnect replay", async () => {
+	it("keeps one-shot issuer private while registering new, switched, and restored sessions", async () => {
 		if (process.platform === "win32") return;
 		const root = tempDir();
 		const agentDir = join(root, "agent");
@@ -371,11 +372,12 @@ describe("daemon supervisor resident workers", () => {
 		const sessionDir = join(agentDir, "sessions");
 		const socketPath = join(tmpdir(), `prime-supervisor-issuer-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
 		const markerPath = join(root, "worker-issuer-result.json");
+		const sessionEventsPath = join(root, "worker-session-events.jsonl");
 		const extensionPath = join(root, "issuer-probe.mjs");
 		mkdirSync(projectDir, { recursive: true });
 		const issuer = "A".repeat(43);
 		writeFileSync(extensionPath, `
-			import { closeSync, existsSync, fstatSync, readSync, writeFileSync } from "node:fs";
+			import { appendFileSync, closeSync, existsSync, fstatSync, readSync, writeFileSync } from "node:fs";
 			import { createHash } from "node:crypto";
 			import { spawnSync } from "node:child_process";
 			const fd = Number(process.env.PI_CAD_SESSION_ISSUER_FD);
@@ -405,7 +407,11 @@ describe("daemon supervisor resident workers", () => {
 				workerEnvRemoved: process.env.PI_CAD_SESSION_ISSUER_FD === undefined,
 				child: JSON.parse(child.stdout),
 			}));
-			export default function issuerProbe() {}
+			export default function issuerProbe(pi) {
+				pi.on("session_start", (event, ctx) => {
+					appendFileSync(${JSON.stringify(sessionEventsPath)}, JSON.stringify({ reason: event.reason, sessionId: ctx.sessionManager.getSessionId() }) + "\\n");
+				});
+			}
 		`, { encoding: "utf8" });
 
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, ["--extension", extensionPath]);
@@ -448,10 +454,43 @@ ${readDaemonLogs(agentDir)}`);
 		if (!replay.success) expect(replay.error).toMatch(/already been consumed/);
 		expect(countWorkerDescriptors(agentDir)).toBe(1);
 		secondClient.close();
+
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const createdNew = await client.request({ type: "new_session", activeSessionId });
+		expect(createdNew.success).toBe(true);
+		const switchedBack = await client.request({ type: "switch_session", activeSessionId, sessionPath: summary.sessionFile });
+		expect(switchedBack.success).toBe(true);
+		await waitForCondition(() => existsSync(sessionEventsPath) && readFileSync(sessionEventsPath, "utf8").trim().split("\n").length >= 3, "Worker did not report new and restored session starts");
+		const sessionEvents = readFileSync(sessionEventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { reason: string; sessionId: string });
+		expect(new Set(sessionEvents.map((event) => event.sessionId)).size).toBeGreaterThanOrEqual(2);
+		expect(sessionEvents.map((event) => event.reason)).toEqual(expect.arrayContaining(["new", "resume"]));
+
 		await client.request({ type: "shutdown" });
 		client.close();
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+
+		const restoredSupervisor = spawnSupervisor(agentDir, socketPath, projectDir, ["--extension", extensionPath]);
+		const restoredClient = await connectEventually(socketPath, restoredSupervisor);
+		const restored = await restoredClient.request({
+			type: "create",
+			sessionPath: summary.sessionFile,
+			sessionIssuerCapability: "B".repeat(43),
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, extensions: [extensionPath] },
+		});
+		if (!restored.success) throw new Error(`Issuer restore worker create failed: ${restored.error}`);
+		const restoredSummary = requireSummary(restored.data);
+		if (!restoredSummary.workerPid) throw new Error("Restored issuer worker did not expose its pid");
+		workerPids.add(restoredSummary.workerPid);
+		await waitForCondition(() => existsSync(sessionEventsPath) && readFileSync(sessionEventsPath, "utf8").trim().split("\n").length >= 4, "Restored worker did not start the saved session");
+		const restoredEvents = readFileSync(sessionEventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { reason: string; sessionId: string });
+		expect(restoredEvents.at(-1)?.reason).toBe("startup");
+		expect(restoredEvents.at(-1)?.sessionId).toBe(sessionEvents[0]?.sessionId);
+		await restoredClient.request({ type: "shutdown" });
+		restoredClient.close();
+		await waitForProcessGone(restoredSummary.workerPid);
+		workerPids.delete(restoredSummary.workerPid);
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 

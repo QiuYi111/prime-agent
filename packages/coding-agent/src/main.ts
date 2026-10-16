@@ -1092,8 +1092,7 @@ async function createDaemonClientConnection(options: {
 			}
 		}
 
-		const sessionIssuerCapability =
-			!options.sessionPath && !options.continueRecent && !options.noSession ? takeSessionIssuerCapability() : undefined;
+		const sessionIssuerCapability = !options.noSession ? takeSessionIssuerCapability() : undefined;
 		if (sessionIssuerCapability && !client.supportsServerCapability("session_issuer_bootstrap")) {
 			throw new Error("The running Prime Agent daemon cannot accept the session issuer bootstrap; restart it and retry");
 		}
