@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { dirname } from "node:path";
-import { type Context, type Model, type SimpleStreamOptions, stream } from "@earendil-works/pi-ai";
+import { type Context, type Model, type SimpleStreamOptions, streamSimple } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "./model-registry.js";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -98,7 +98,7 @@ export async function startDelegatedProviderBroker(
 				model.maxTokens,
 			),
 		);
-		const providerStream = stream(model, request.context, {
+		const providerStream = streamSimple(model, request.context, {
 			...request.options,
 			maxTokens,
 			apiKey: auth.apiKey,

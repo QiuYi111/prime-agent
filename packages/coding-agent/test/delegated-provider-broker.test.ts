@@ -166,6 +166,36 @@ describe("trusted SDK provider broker", () => {
 		expect(hostAborted).toBe(true);
 	});
 
+	it("preserves reasoning options from a delegated provider stream", async () => {
+		let hostReasoning: string | undefined;
+		const stream = (_model: any, _context: any, _options: any): AssistantMessageEventStream => {
+			throw new Error("plain stream path must not be used for simple streams");
+		};
+		const streamSimple = (_model: any, _context: any, options: any): AssistantMessageEventStream => {
+			hostReasoning = options.reasoning;
+			const result = createAssistantMessageEventStream();
+			const message: AssistantMessage = {
+				role: "assistant", content: [], api: "broker-test-api", provider: "broker-test", model: "model-1",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop", timestamp: Date.now(),
+			};
+			result.push({ type: "start", partial: message });
+			result.push({ type: "done", reason: "stop", message });
+			return result;
+		};
+		registerApiProvider({ api: "broker-test-api", stream, streamSimple });
+		root = await mkdtemp(join(tmpdir(), "pi-provider-broker-reasoning-"));
+		const capability = "broker-capability-that-is-only-valid-for-this-test-123456";
+		const registry = modelRegistry();
+		broker = await startDelegatedProviderBroker({
+			socketPath: join(root, "provider.sock"), capability, modelRegistry: registry,
+			allowedModels: [{ provider: "broker-test", api: "broker-test-api", id: "model-1" }],
+		});
+		const adapter = createDelegatedProviderAdapter({ socketPath: join(root, "provider.sock"), capability });
+		for await (const _event of adapter.streamSimple(registry.find("broker-test", "model-1")!, { messages: [] }, { reasoning: "low" })) { }
+		expect(hostReasoning).toBe("low");
+	});
+
 	it("refreshes OAuth only in the host before dispatching the provider stream", async () => {
 		const provider = `broker-oauth-${randomUUID()}`;
 		let refreshCalls = 0;
