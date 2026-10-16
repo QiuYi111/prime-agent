@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { AGENT_MESSAGE_SKILL_NAME, type AgentSessionMessageController } from "../src/core/agent-messages.js";
 import { AGENT_OBSERVE_SKILL_NAME, type AgentObserveController } from "../src/core/agent-observe.js";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
@@ -28,12 +29,42 @@ describe("createAgentSessionFromServices", () => {
 		}
 	});
 
+	it("enables CLI login reuse only for default services storage", async () => {
+		const tempDir = join(tmpdir(), `pi-default-services-auth-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		vi.stubEnv("HOME", tempDir);
+		vi.stubEnv(ENV_AGENT_DIR, "");
+		const injected = AuthStorage.inMemory();
+		for (const options of [{}, { agentDir: join(tempDir, "custom") }, { authStorage: injected }]) {
+			const services = await createAgentSessionServices({
+				cwd: tempDir,
+				...options,
+				telemetryDisabled: true,
+				resourceLoaderOptions: {
+					noExtensions: true,
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					noContextFiles: true,
+				},
+			});
+			expect(services.modelRegistry.authStorage).toBe(services.authStorage);
+			expect(services.authStorage.getPrimeCliConfigPath()).toBe(
+				"agentDir" in options || "authStorage" in options ? undefined : join(tempDir, ".prime", "config.json"),
+			);
+			if ("authStorage" in options) expect(services.authStorage).toBe(injected);
+		}
+	});
+
 	it("shows the telemetry disclosure independently of the Herdr reporter", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-telemetry-notice-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 		cleanupPaths.push(tempDir);
 		const settingsManager = SettingsManager.inMemory();
+		settingsManager.setOnboardingShown(true);
 
 		const services = await createAgentSessionServices({
 			cwd: tempDir,
@@ -49,7 +80,56 @@ describe("createAgentSessionFromServices", () => {
 		expect(settingsManager.getTelemetryNoticeShown()).toBe(true);
 	});
 
+	it("defers the telemetry disclosure on a first interactive launch", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
+		const tempDir = join(tmpdir(), `pi-session-telemetry-first-run-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		// A settings profile that has never seen onboarding: the notice would land
+		// on the welcome screen, so it waits for the next launch.
+		const settingsManager = SettingsManager.inMemory();
+
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			settingsManager,
+			noBuiltinHerdrReporter: true,
+			deferTelemetryNoticeForOnboarding: true,
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+
+		expect(services.diagnostics).not.toContainEqual(
+			expect.objectContaining({ message: expect.stringContaining("pseudonymous usage") }),
+		);
+		expect(settingsManager.getTelemetryNoticeShown()).toBe(false);
+	});
+
+	it("discloses telemetry immediately for sessions that never onboard", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
+		const tempDir = join(tmpdir(), `pi-session-telemetry-headless-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		// No onboarding will run here, so holding the notice back would hide it forever.
+		const settingsManager = SettingsManager.inMemory();
+
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			settingsManager,
+			noBuiltinHerdrReporter: true,
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+
+		expect(services.diagnostics).toContainEqual(
+			expect.objectContaining({ message: expect.stringContaining("pseudonymous usage") }),
+		);
+		expect(settingsManager.getTelemetryNoticeShown()).toBe(true);
+	});
+
 	it("honors an explicit daemon-carried telemetry opt-out", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-daemon-telemetry-opt-out-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -81,6 +161,7 @@ describe("createAgentSessionFromServices", () => {
 	});
 
 	it("does not install top-level telemetry for a resumed child session", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-child-telemetry-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -148,7 +229,7 @@ describe("createAgentSessionFromServices", () => {
 		try {
 			const initialPrompt = session.systemPrompt;
 			expect(initialPrompt).toContain(
-				"Generic MCP connections are accessed through the pre-imported Python `mcp` object in IPython, not as top-level native tool namespaces or installed Python skills.",
+				"Generic MCP connections are accessed through the pre-imported Python `mcp` object in the Python REPL, not as top-level native tool namespaces or installed Python skills.",
 			);
 			expect(initialPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
 			expect(initialPrompt).toContain('await mcp.list_tools("filesystem")');
@@ -183,7 +264,9 @@ describe("createAgentSessionFromServices", () => {
 				],
 				"owner-a",
 			);
-			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `task`, `zebra`.");
+			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
+			expect(session.systemPrompt).not.toContain('await mcp.list_tools("task")');
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["mcp_list_tools_task", "mcp_call_task"]));
 			expect(session.systemPrompt).not.toContain("task-secret");
 			rebuildRuntime.mockClear();
 			const waitForIdle = vi.spyOn(session.agent, "waitForIdle");
@@ -199,6 +282,8 @@ describe("createAgentSessionFromServices", () => {
 			expect(execute.mock.calls[0]?.[0]).toContain("await _prime_mcp.reload(_prime_mcp_name)");
 			expect(execute.mock.calls[0]?.[0]).toContain('["task"]');
 			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
+			expect(session.getAllTools().map((tool) => tool.name)).not.toContain("mcp_call_task");
+			expect(session.getActiveToolNames()).not.toContain("mcp_call_task");
 
 			settingsManager.setGlobalMcpServer("added", { type: "stdio", command: "new-secret" });
 			settingsManager.removeGlobalMcpServer("filesystem");

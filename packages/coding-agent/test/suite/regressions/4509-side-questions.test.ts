@@ -1,6 +1,8 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
+import { Type } from "typebox";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { type SideQuestionEvent, startSideQuestion } from "../../../src/core/side-question.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
@@ -23,7 +25,7 @@ describe("ENG-4509 side questions", () => {
 		initTheme("dark");
 	});
 
-	it("uses the current context without tools or session persistence", async () => {
+	it("uses the current context without session persistence", async () => {
 		const harness = await createHarness({ systemPrompt: "Remember relevant project context." });
 		try {
 			harness.setResponses([fauxAssistantMessage("The codename is kestrel.")]);
@@ -39,8 +41,8 @@ describe("ENG-4509 side questions", () => {
 			harness.setResponses([
 				(context, options) => {
 					expect(context.systemPrompt).toBe(systemPromptBefore);
-					expect(context.tools).toEqual([]);
 					expect(context.messages.map(getMessageText)).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"The project codename is kestrel.",
 						"The codename is kestrel.",
 						expect.stringContaining("What is the project codename?"),
@@ -81,16 +83,16 @@ describe("ENG-4509 side questions", () => {
 				(context) => {
 					const texts = context.messages.map(getMessageText);
 					expect(texts).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"Main context message.",
 						"main answer",
 						expect.stringContaining("First side question?"),
 						"first side answer",
 						expect.stringContaining("Second side question?"),
 					]);
-					expect(context.tools).toEqual([]);
 					// The instruction is repeated only on the first side turn.
-					expect(texts[2]).toContain("Answer this side question");
-					expect(texts[4]).not.toContain("Answer this side question");
+					expect(texts[3]).toContain("asked this via `/btw`");
+					expect(texts[5]).not.toContain("asked this via `/btw`");
 					return fauxAssistantMessage("second side answer");
 				},
 			]);
@@ -113,6 +115,179 @@ describe("ENG-4509 side questions", () => {
 		}
 	});
 
+	let probeExecutions = 0;
+	const probe: AgentTool = {
+		name: "probe",
+		label: "Probe",
+		description: "Records executions",
+		parameters: Type.Object({}),
+		execute: async () => {
+			probeExecutions += 1;
+			return { content: [{ type: "text", text: "executed" }], details: {} };
+		},
+	};
+
+	it("sends the session's tool declarations but blocks their execution", async () => {
+		const harness = await createHarness({ tools: [probe] });
+		try {
+			let mainTools: unknown;
+			harness.setResponses([
+				(context) => {
+					mainTools = context.tools;
+					return fauxAssistantMessage("main answer");
+				},
+			]);
+			await harness.session.prompt("Main context message.");
+
+			let secondTurnTexts: string[] = [];
+			harness.setResponses([
+				(context) => {
+					expect(context.tools).toEqual(mainTools);
+					return fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" });
+				},
+				(context) => {
+					secondTurnTexts = context.messages.map(getMessageText);
+					return fauxAssistantMessage("answered from context");
+				},
+			]);
+
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(harness.session.agent, "tools-1", "Which tool would you use?", (event) => {
+				events.push(event);
+			});
+			await run.done;
+
+			expect(probeExecutions).toBe(0);
+			expect(secondTurnTexts.some((text) => text.includes("Tools are deactivated in this side thread"))).toBe(true);
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "answered from context" });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("answers empty when the terminal turn is textless without tool calls", async () => {
+		const harness = await createHarness({ tools: [probe] });
+		try {
+			harness.setResponses([fauxAssistantMessage("main answer")]);
+			await harness.session.prompt("Main context message.");
+			harness.setResponses([
+				fauxAssistantMessage([{ type: "text", text: "Checking." }, fauxToolCall("probe", {})], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("", { stopReason: "stop" }),
+			]);
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(harness.session.agent, "tools-3", "Empty finish?", (event) => {
+				events.push(event);
+			});
+			await run.done;
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "" });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("stops after three turns when the model keeps calling tools", async () => {
+		const harness = await createHarness({ tools: [probe] });
+		try {
+			harness.setResponses([fauxAssistantMessage("main answer")]);
+			await harness.session.prompt("Main context message.");
+
+			const callsBefore = harness.faux.state.callCount;
+			harness.setResponses([
+				fauxAssistantMessage([{ type: "text", text: "Checking." }, fauxToolCall("probe", {})], {
+					stopReason: "toolUse",
+				}),
+				// This turn streams thinking before its tool call, so its mid-turn updates
+				// are textless while the first turn's answer is the run's only text.
+				fauxAssistantMessage([fauxThinking("still stuck"), fauxToolCall("probe", {})], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" }),
+			]);
+
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(harness.session.agent, "tools-2", "Keep trying?", (event) => {
+				events.push(event);
+			});
+			await run.done;
+
+			expect(harness.faux.state.callCount - callsBefore).toBe(3);
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "Checking." });
+			// Streamed text must never be wiped mid-run by textless updates.
+			const running = events.filter((event) => event.status === "running");
+			const firstText = running.findIndex((event) => event.answer !== "");
+			expect(firstText).toBeGreaterThanOrEqual(0);
+			expect(running.slice(firstText).every((event) => event.answer !== "")).toBe(true);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("derives the answer from finished turns when a retried run ends on tool calls", async () => {
+		const harness = await createHarness({ tools: [probe] });
+		try {
+			harness.setResponses([fauxAssistantMessage("main answer")]);
+			await harness.session.prompt("Main context message.");
+			harness.setResponses([
+				fauxAssistantMessage([{ type: "text", text: "Checking." }, fauxToolCall("probe", {})], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("Almost 42", { stopReason: "error", errorMessage: "500 Internal Server Error" }),
+				fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" }),
+			]);
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(
+				harness.session.agent,
+				"retry-2",
+				"Survives a failed turn?",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				{ enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 },
+			);
+			await run.done;
+			// The failed turn's streamed partial is not the outcome; finished turns are.
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "Checking." });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("retries a transient provider error once and completes", async () => {
+		const harness = await createHarness();
+		try {
+			harness.setResponses([fauxAssistantMessage("main answer")]);
+			await harness.session.prompt("Main context message.");
+
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "500 Internal Server Error" }),
+				fauxAssistantMessage("recovered side answer"),
+			]);
+			const callsBefore = harness.faux.state.callCount;
+
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(
+				harness.session.agent,
+				"retry-1",
+				"Does this survive a transient failure?",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				{ enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 },
+			);
+			await run.done;
+
+			expect(harness.faux.state.callCount - callsBefore).toBe(2);
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "recovered side answer" });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("can finish while the main agent is still working", async () => {
 		const harness = await createHarness();
 		const mainStarted = deferred();
@@ -125,8 +300,8 @@ describe("ENG-4509 side questions", () => {
 					return fauxAssistantMessage("main complete");
 				},
 				(context) => {
-					expect(context.tools).toEqual([]);
 					expect(context.messages.map(getMessageText)).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"Run the main task.",
 						expect.stringContaining("Can I ask this concurrently?"),
 					]);
@@ -872,6 +1047,7 @@ describe("ENG-4509 side questions", () => {
 			isAgentCompacting: () => false,
 			isBashRunning: () => true,
 			applyConnectionStateSnapshot: vi.fn(),
+			refreshQueueSelectionFromState: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
@@ -880,10 +1056,11 @@ describe("ENG-4509 side questions", () => {
 			})),
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
-			refreshConnectionQueue: vi.fn(async () => {}),
+			updatePendingMessagesDisplay: vi.fn(),
 			flushCompactionQueue: vi.fn(async () => {}),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -906,6 +1083,7 @@ describe("ENG-4509 side questions", () => {
 			messages: [],
 		});
 
+		expect(fakeThis.updatePendingMessagesDisplay).toHaveBeenCalledOnce();
 		expect(bashComponent.setComplete).toHaveBeenCalledWith(undefined, false);
 		expect(finishBash).toHaveBeenCalledOnce();
 		expect(fakeThis.activeBashComponent).toBeUndefined();

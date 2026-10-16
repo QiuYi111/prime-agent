@@ -1,5 +1,4 @@
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
 import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -9,11 +8,12 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
+import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
+import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 8;
+const BOOTSTRAP_SCHEMA = 9;
 const PYTHON_VERSION = "3.11";
-const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
 // Serializes the kernel's user namespace so it can be revived across session
 // resume. Internal-only; intentionally not surfaced to the model as an import.
@@ -35,6 +35,42 @@ const DEFAULT_RLM_EXTRA_PACKAGES = [
 export const DEFAULT_RLM_EXTRA_UV_ARGS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.uvArg);
 export const DEFAULT_RLM_EXTRA_IMPORT_NAMES = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.importName);
 export const DEFAULT_RLM_EXTRA_IMPORT_LABELS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.promptLabel);
+const WINDOWS_PATHEXT_DEFAULT = [".COM", ".EXE", ".BAT", ".CMD"];
+const WINDOWS_SUPPORTED_EXECUTABLE_EXTENSIONS = new Set(
+	WINDOWS_PATHEXT_DEFAULT.map((extension) => extension.toLowerCase()),
+);
+
+export interface BatchShimInvocation {
+	args: string[];
+	env: NodeJS.ProcessEnv;
+}
+
+/** Build a cmd.exe invocation without embedding user-controlled values in its command string. */
+export function buildBatchShimInvocation(
+	command: string,
+	args: readonly string[],
+	baseEnv: NodeJS.ProcessEnv,
+	token = randomUUID().replaceAll("-", ""),
+): BatchShimInvocation {
+	if (!/^[A-Za-z0-9_]+$/.test(token)) {
+		throw new Error("Windows batch shim token contains unsupported characters");
+	}
+	const values = [command, ...args];
+	if (values.some((value) => /["\0\r\n]/.test(value))) {
+		throw new Error("Windows batch shim paths and arguments cannot contain quotes, NUL, or line breaks");
+	}
+	const env = { ...baseEnv };
+	const variables = values.map((value, index) => {
+		const name = `PRIME_AGENT_BATCH_${token}_${index}`;
+		env[name] = value;
+		return `"%${name}%"`;
+	});
+	return {
+		args: ["/d", "/v:off", "/s", "/c", `"${variables.join(" ")}"`],
+		env,
+	};
+}
+
 const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
 const REQUIRED_HARNESS_METHODS = [
 	"create_memory",
@@ -51,7 +87,7 @@ const REQUIRED_HARNESS_METHODS = [
 	"delete_prompt_note",
 	"record_refinement",
 ];
-const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')`;
+const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -76,7 +112,6 @@ interface BootstrapPythonSkill {
 
 interface BootstrapVersion {
 	schema: number;
-	ipykernel?: string;
 	runtime?: string;
 	snapshot?: string;
 	extraUvArgs?: string[];
@@ -85,10 +120,6 @@ interface BootstrapVersion {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function isNodeError(error: unknown, code: string): boolean {
-	return error instanceof Error && "code" in error && error.code === code;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -365,17 +396,25 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 			return fallback;
 		} catch (fallbackError) {
 			throw new Error(
-				`couldn't create kernel venv directory at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with ipykernel installed. ${errorMessage(fallbackError)}`,
+				`couldn't create kernel venv directory at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with a current prime-agent-runtime installed. ${errorMessage(fallbackError)}`,
 			);
 		}
 	}
 }
 
+function isBatchShim(command: string): boolean {
+	return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+}
+
 function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, {
-			env: process.env,
+		// CPython must read UTF-8 .pth files even under a Windows legacy code page.
+		const env = { ...process.env, ...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}) };
+		const batch = isBatchShim(command) ? buildBatchShimInvocation(command, args, env) : undefined;
+		const child = spawnHidden(batch ? (process.env.ComSpec ?? "cmd.exe") : command, batch?.args ?? args, {
+			env: batch?.env ?? env,
 			stdio: options.stdio ?? "ignore",
+			...(batch ? { windowsVerbatimArguments: true } : {}),
 		});
 		child.on("error", reject);
 		child.on("exit", (code, signal) => {
@@ -396,10 +435,6 @@ async function pythonImports(python: string, moduleName: string): Promise<boolea
 	} catch {
 		return false;
 	}
-}
-
-async function hasIpykernel(python: string): Promise<boolean> {
-	return pythonImports(python, "ipykernel");
 }
 
 async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
@@ -446,25 +481,6 @@ function bootstrapLockDir(venv: string): string {
 	return path.join(path.dirname(venv), `${path.basename(venv)}${BOOTSTRAP_LOCK_NAME}`);
 }
 
-function processIsRunning(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return isNodeError(error, "EPERM");
-	}
-}
-
-async function readLockPid(lockDir: string): Promise<number | null> {
-	try {
-		const raw = await readFile(path.join(lockDir, "pid"), "utf8");
-		const pid = Number.parseInt(raw.trim(), 10);
-		return Number.isInteger(pid) && pid > 0 ? pid : null;
-	} catch {
-		return null;
-	}
-}
-
 async function lockMissingPidIsStale(lockDir: string): Promise<boolean> {
 	try {
 		const lockStat = await stat(lockDir);
@@ -479,28 +495,43 @@ async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> 
 	await mkdir(path.dirname(lockDir), { recursive: true });
 
 	for (;;) {
-		try {
-			await mkdir(lockDir);
-			await writeFile(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
+		const attempt = await tryAcquireDirLock(lockDir, async (ownerPid) =>
+			ownerPid === undefined ? !(await lockMissingPidIsStale(lockDir)) : isProcessAlive(ownerPid),
+		);
+		if (attempt === "acquired") {
 			return () => rm(lockDir, { recursive: true, force: true });
-		} catch (error) {
-			if (!isNodeError(error, "EEXIST")) throw error;
-
-			const pid = await readLockPid(lockDir);
-			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIsRunning(pid)) {
-				await rm(lockDir, { recursive: true, force: true });
-				continue;
-			}
-
+		}
+		if (attempt === "held") {
 			await sleep(BOOTSTRAP_LOCK_RETRY_MS);
 		}
 	}
 }
 
+/** Try a bare command followed by supported PATHEXT extensions in the configured order. */
+export function windowsExecutableCandidates(name: string, pathext: string | undefined): string[] {
+	const extensions = (pathext ?? "")
+		.split(";")
+		.map((ext) => ext.trim().toLowerCase())
+		.filter((ext) => WINDOWS_SUPPORTED_EXECUTABLE_EXTENSIONS.has(ext));
+	const lowerName = name.toLowerCase();
+	if (WINDOWS_PATHEXT_DEFAULT.some((ext) => lowerName.endsWith(ext.toLowerCase()))) {
+		return [name];
+	}
+	const seen = new Set<string>([name.toLowerCase()]);
+	const candidates = [name];
+	for (const ext of extensions.length > 0 ? extensions : WINDOWS_PATHEXT_DEFAULT) {
+		const candidate = `${name}${ext}`;
+		if (seen.has(candidate.toLowerCase())) continue;
+		seen.add(candidate.toLowerCase());
+		candidates.push(candidate);
+	}
+	return candidates;
+}
+
 async function findExecutable(name: string): Promise<string | null> {
 	const pathValue = process.env.PATH;
 	if (!pathValue) return null;
-	const candidates = process.platform === "win32" ? [name, `${name}.exe`] : [name];
+	const candidates = process.platform === "win32" ? windowsExecutableCandidates(name, process.env.PATHEXT) : [name];
 	for (const dir of pathValue.split(path.delimiter)) {
 		if (!dir) continue;
 		for (const candidate of candidates) {
@@ -586,7 +617,6 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 		}
 		return {
 			schema: parsed.schema,
-			ipykernel: typeof parsed.ipykernel === "string" ? parsed.ipykernel : undefined,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
@@ -633,7 +663,6 @@ function bootstrapVersionCurrent(
 function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeIdentity: string): boolean {
 	return (
 		version?.schema === BOOTSTRAP_SCHEMA &&
-		version.ipykernel === IPYKERNEL_REQUIREMENT &&
 		version.runtime === runtimeIdentity &&
 		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
 		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
@@ -647,7 +676,6 @@ async function writeBootstrapVersion(
 ): Promise<void> {
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
-		ipykernel: IPYKERNEL_REQUIREMENT,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -658,12 +686,10 @@ async function writeBootstrapVersion(
 
 function runtimeCandidateDirs(): string[] {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-	// dist/prime-agent-runtime is listed first deliberately: it is the only path stable
-	// across every shipped layout (dist/, dist/bundle/, bun), where import.meta.url-relative
-	// resolution breaks. `npm run build` rebuilds it from live source (copy-assets does
-	// rm -rf + cp), so the staleness hash still refreshes on every build. The relative
-	// paths below cover running from source (tsx) where dist/ hasn't been built.
+	// Compiled executables use a flat sidecar layout; Node packages keep sources in dist/.
+	// Resolve both from the physical package directory, outside Bun's virtual filesystem.
 	return [
+		path.join(getPackageDir(), "prime-agent-runtime"),
 		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
@@ -718,6 +744,10 @@ async function hashRuntimeSource(sourceDir: string): Promise<string> {
 	return `sha256:${hash.digest("hex")}`;
 }
 
+export function kernelVenvPython(venv: string, platform: NodeJS.Platform = process.platform): string {
+	return platform === "win32" ? path.join(venv, "Scripts", "python.exe") : path.join(venv, "bin", "python");
+}
+
 async function bootstrapVenv(
 	venv: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
@@ -725,7 +755,7 @@ async function bootstrapVenv(
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
 	const uv = await ensureUv(options);
-	const python = path.join(venv, "bin", "python");
+	const python = kernelVenvPython(venv);
 	const sourceDir = await resolveRuntimeSourceDir();
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
@@ -737,7 +767,6 @@ async function bootstrapVenv(
 		"install",
 		"--python",
 		python,
-		IPYKERNEL_REQUIREMENT,
 		runtimeRequirement,
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -825,7 +854,6 @@ async function syncPythonSkills(
 
 async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
 	return (
-		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
 		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
 	);
@@ -838,7 +866,6 @@ async function kernelReady(
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<boolean> {
 	return (
-		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
 		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
 	);
@@ -847,8 +874,9 @@ async function kernelReady(
 function formatBootstrapFailure(error: unknown): Error {
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
-			"First-time setup needs internet to install uv, Python, ipykernel, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
-			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with ipykernel, a current prime-agent-runtime, and default Python packages installed to skip auto-bootstrap.",
+			"First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
+			"An interrupted runtime upgrade needs network once more, so re-run this while online. " +
+			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap.",
 	);
 }
 
@@ -859,11 +887,15 @@ async function ensureKernelPythonUncached(
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
+		if (isBatchShim(python)) {
+			throw new Error(
+				`PRIME_AGENT_KERNEL_PYTHON must point directly to a Python executable, not a Windows batch shim: ${python}`,
+			);
+		}
 		const missing: string[] = [];
-		if (!(await hasIpykernel(python))) missing.push("ipykernel");
 		if (!(await hasPrimeAgentRuntime(python))) {
 			missing.push(
-				"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",
+				"a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, and explicit harness CRUD methods",
 			);
 		}
 		if (missing.length === 0) {
@@ -886,7 +918,7 @@ async function ensureKernelPythonUncached(
 	}
 
 	const venv = await resolveWritableKernelVenvDir();
-	const python = path.join(venv, "bin", "python");
+	const python = kernelVenvPython(venv);
 	const runtimeIdentity = await resolveRuntimeIdentity();
 	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 

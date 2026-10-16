@@ -94,6 +94,12 @@ const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixtu
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+// The fixture must run in the spawned process itself: the tsx CLI wrapper forks,
+// which would leave the spawned pid owning only tsx IPC pipes while the real
+// supervisor (and its daemon socket) hides in an untracked child pid — invisible
+// to the OS socket sweep this regression exercises. `--import` with tsx's ESM
+// loader runs the TypeScript fixture in-process.
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/esm/index.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<ProcessHandle>();
@@ -147,7 +153,7 @@ async function createPaths(): Promise<TestPaths> {
 
 function spawnSupervisor(paths: TestPaths): ProcessHandle {
 	return trackProcess(
-		spawn(paths.executablePath, [tsxPath, fixturePath], {
+		spawn(paths.executablePath, ["--import", tsxLoaderPath, fixturePath], {
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -1047,15 +1053,35 @@ describe("ENG-4603 worker recovery convergence", () => {
 		await waitForType(successor, "ready", 60_000);
 		const successorStartId = getProcessStartId(successor.child.pid!);
 		client.close();
+		const unrelatedPaths = await createPaths();
+		const unrelated = spawnSupervisor(unrelatedPaths);
+		await waitForType(unrelated, "booted");
+		unrelated.child.send({ type: "go" });
+		await waitForType(unrelated, "ready", 60_000);
 		const systemLsofPath = spawnSync("which", ["lsof"], { encoding: "utf8" }).stdout.trim();
 		if (!systemLsofPath) throw new Error("Could not locate lsof for the shutdown regression");
 		const lsofPath = join(paths.agentDir, "lsof");
 		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pn -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
 			mode: 0o700,
 		});
+		const systemSsPath = spawnSync("which", ["ss"], { encoding: "utf8" }).stdout.trim();
+		const ssPath = join(paths.agentDir, "ss");
+		writeFileSync(
+			ssPath,
+			`#!/bin/sh
+[ -n "$ENG_4603_SYSTEM_SS" ] || exit 1
+listeners=$("$ENG_4603_SYSTEM_SS" "$@") || exit $?
+printf '%s\\n' "$listeners" | awk -v pids="$ENG_4603_LSOF_PIDS" '
+ BEGIN { count=split(pids, allowed, ",") }
+ { for (i=1; i<=count; i++) if (index($0, "pid=" allowed[i] ",")) { print; break } }
+'
+`,
+			{ mode: 0o700 },
+		);
 		const lsofEnvironment = {
 			ENG_4603_LSOF_PIDS: `${predecessor.child.pid},${successor.child.pid},${workerPid}`,
 			ENG_4603_SYSTEM_LSOF: systemLsofPath,
+			ENG_4603_SYSTEM_SS: systemSsPath,
 			PATH: `${paths.agentDir}:${process.env.PATH ?? ""}`,
 		};
 		const listenersBeforeShutdown = spawnSync(lsofPath, [], {
@@ -1066,8 +1092,11 @@ describe("ENG-4603 worker recovery convergence", () => {
 		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
 
 		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
-		expect(shutdown.code).toBe(0);
+		expect(shutdown.code, `${shutdown.stdout}\n${shutdown.stderr}`).toBe(0);
 		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
+		expect(exactProcessIsAlive(unrelated.child.pid!, unrelated.identity?.processStartId)).toBe(true);
+		const unrelatedClient = await connectEventually(unrelatedPaths.socketPath);
+		unrelatedClient.close();
 		const survivingIdentities = [
 			{ pid: predecessor.child.pid!, processStartId: predecessorStartId },
 			{ pid: successor.child.pid!, processStartId: successorStartId },

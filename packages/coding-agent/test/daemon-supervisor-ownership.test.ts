@@ -2,14 +2,19 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
 	assertDaemonSupervisorOwnerCurrent,
+	listDaemonSupervisorSocketPathsForAgentDir,
 	persistDaemonStartupFenceFromOwner,
 } from "../src/modes/daemon/daemon-supervisor-ownership.js";
+import * as childProcessModule from "../src/utils/child-process.js";
+import { isZombieProcess } from "../src/utils/child-process.js";
+import { spawnZombieProcess } from "./fixtures/zombie-process.js";
 
 type Ownership = Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 
@@ -139,6 +144,57 @@ describe("daemon supervisor ownership registry", () => {
 		await legacyOwner.release();
 	});
 
+	it("lists supervisor sockets from the legacy registry for the same agent dir", async () => {
+		const paths = createPaths();
+		const legacyDir = join(paths.root, "legacy-registry");
+		const legacyOwner = await acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "legacy-discovery-owner",
+			registryDir: legacyDir,
+			socketPath: paths.socketPath,
+		});
+
+		// The pre-move record keeps the daemon discoverable by the state root
+		// that owns the agent dir; the current registry alone has nothing.
+		expect(listDaemonSupervisorSocketPathsForAgentDir(paths.agentDir, paths.registryDir)).toEqual([]);
+		expect(listDaemonSupervisorSocketPathsForAgentDir(paths.agentDir, paths.registryDir, legacyDir)).toEqual([
+			legacyOwner.record.socketPath,
+		]);
+
+		// The legacy registry scopes by agent dir exactly like the current one.
+		expect(
+			listDaemonSupervisorSocketPathsForAgentDir(join(paths.root, "other-agent"), paths.registryDir, legacyDir),
+		).toEqual([]);
+
+		await legacyOwner.release();
+	});
+
+	it("skips records whose agent dir cannot be canonicalized instead of aborting discovery", async () => {
+		const paths = createPaths();
+		const owner = await acquire(paths, "discovery-owner");
+		const brokenDir = join(paths.registryDir, "broken.owner");
+		mkdirSync(brokenDir, { recursive: true, mode: 0o700 });
+		// A valid record shape whose agent dir path can no longer be canonicalized
+		// (ENOTDIR under /dev/null): one stale record must not hide the others.
+		const broken = {
+			...owner.record,
+			token: "broken-token",
+			generation: "broken-owner",
+			agentDir: "/dev/null/agent",
+			socketPath: join(paths.root, "broken.sock"),
+		};
+		writeFileSync(join(brokenDir, "owner.json"), `${JSON.stringify(broken, null, 2)}\n`);
+
+		expect(listDaemonSupervisorSocketPathsForAgentDir(paths.agentDir, paths.registryDir)).toEqual([
+			owner.record.socketPath,
+		]);
+		expect(listDaemonSupervisorSocketPathsForAgentDir("/dev/null/agent", paths.registryDir)).toEqual([]);
+
+		await owner.release();
+	});
+
 	it("legacy registry reads never reclaim abandoned legacy directories", async () => {
 		const paths = createPaths();
 		const legacyDir = join(paths.root, "legacy-registry");
@@ -173,6 +229,63 @@ describe("daemon supervisor ownership registry", () => {
 		await expect(reaped.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
 		expect(existsSync(reapedDir)).toBe(false);
 		await reaped.release();
+	});
+
+	it("confirms owner zombie state at most once per interval across fence polls", async () => {
+		const paths = createPaths();
+		const owner = await acquire(paths, "fence-owner");
+		const claim = {
+			generation: owner.record.generation,
+			pid: owner.record.pid,
+			processStartId: owner.record.processStartId,
+			socketPath: owner.record.socketPath,
+		};
+		const fingerprint = await assertDaemonSupervisorOwnerCurrent(claim, undefined, paths.registryDir);
+		const zombieSpy = vi.spyOn(childProcessModule, "isZombieProcess");
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive");
+		try {
+			// Steady-state fence polls (validated fingerprint, confirmed owner) must
+			// not run a ps-backed probe per 250ms tick; existence stays kill(0)-cheap.
+			await assertDaemonSupervisorOwnerCurrent(claim, fingerprint, paths.registryDir);
+			await assertDaemonSupervisorOwnerCurrent(claim, fingerprint, paths.registryDir);
+			expect(zombieSpy.mock.calls.length + aliveSpy.mock.calls.length).toBe(0);
+			// Confirmations expire: after the interval the owner is re-probed once
+			// (the same timestamp the cache's bounded prune sweeps on).
+			vi.useFakeTimers();
+			try {
+				vi.setSystemTime(Date.now() + 6000);
+				await assertDaemonSupervisorOwnerCurrent(claim, fingerprint, paths.registryDir);
+				expect(zombieSpy).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		} finally {
+			zombieSpy.mockRestore();
+			aliveSpy.mockRestore();
+			await owner.release();
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("treats a zombie owner process as reclaimable", async () => {
+		const paths = createPaths();
+		const { zombiePid, dispose } = await spawnZombieProcess();
+		try {
+			expect(isZombieProcess(zombiePid)).toBe(true);
+			const stale = await acquire(paths, "zombie-owner");
+			const ownerPath = join(ownerDir(paths, "zombie-owner"), "owner.json");
+			const record = readJson(ownerPath);
+			record.pid = zombiePid;
+			const zombieStartId = getProcessStartId(zombiePid);
+			if (zombieStartId) record.processStartId = zombieStartId;
+			else delete record.processStartId;
+			writeFileSync(ownerPath, `${JSON.stringify(record, null, 2)}\n`);
+
+			const successor = await acquire(paths, "successor-owner");
+			await successor.release();
+			await stale.release();
+		} finally {
+			dispose();
+		}
 	});
 
 	it("does not resurrect the shutdown admission when release overtakes an in-flight renew", async () => {

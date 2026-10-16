@@ -8,11 +8,11 @@ import {
 	type AppMode,
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
-	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
+	resolveActiveSessionLookupFailure,
 	resolveRuntimeSessionOptions,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
@@ -24,6 +24,7 @@ import {
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
+import { DaemonSessionRecoveringError } from "../src/modes/daemon/daemon-errors.js";
 import type { SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
@@ -232,48 +233,6 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(false);
 	});
 
-	test("falls back to local session lookup when daemon active-session probing fails", async () => {
-		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", {
-				lookup: async () => {
-					throw new Error("Daemon returned an invalid active session summary");
-				},
-			}),
-		).resolves.toBeUndefined();
-	});
-
-	test("propagates active-session lookup failures for explicit attach", async () => {
-		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
-				fallbackOnError: false,
-				lookup: async () => {
-					throw new Error("protocol mismatch");
-				},
-			}),
-		).rejects.toThrow("protocol mismatch");
-	});
-
-	test("uses daemon active-session summary when probing succeeds", async () => {
-		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
-				lookup: async () => ({
-					id: "active-1",
-					activeSessionId: "active-1",
-					lifecycle: "draft",
-					activity: "idle",
-					isSessionActive: false,
-					sessionId: "session-1",
-					cwd: "/tmp/project",
-					isStreaming: false,
-					isCompacting: false,
-					attachedClients: 0,
-					messageCount: 0,
-					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
-				}),
-			}),
-		).resolves.toMatchObject({ activeSessionId: "active-1" });
-	});
-
 	test("uses an ephemeral local session manager for fresh daemon-owned sessions", () => {
 		expect(shouldUseEphemeralSessionManagerForDaemonInteractive({})).toBe(true);
 	});
@@ -427,6 +386,20 @@ describe("runtime session option resolution", () => {
 		expect(resolved.rlmParentAgent).toBe("parent-worker");
 	});
 
+	test("forwards semantic spawn lineage to the created child session", () => {
+		const resolved = resolveRuntimeSessionOptions(
+			{},
+			{
+				rlmDepth: 1,
+				semanticParentSessionId: "parent-session-id",
+				semanticSpawnedByRequestId: "a".repeat(32),
+			},
+		);
+
+		expect(resolved.semanticParentSessionId).toBe("parent-session-id");
+		expect(resolved.semanticSpawnedByRequestId).toBe("a".repeat(32));
+	});
+
 	test("deep-merges autonomous runtime session overrides", () => {
 		const resolved = resolveRuntimeSessionOptions(
 			{
@@ -476,6 +449,34 @@ describe("runtime session option resolution", () => {
 			maxContinuations: 5,
 			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
 		});
+	});
+
+	test("classifies active-session lookup failures: recovering is typed, unknown falls back", () => {
+		const recovering = resolveActiveSessionLookupFailure({
+			type: "response",
+			command: "get_state",
+			success: false,
+			error: "Active session active-gap is recovering; retry shortly",
+			errorInfo: { code: "session_recovering", activeSessionId: "active-gap" },
+		});
+		expect(recovering).toBeInstanceOf(DaemonSessionRecoveringError);
+		expect((recovering as DaemonSessionRecoveringError).activeSessionId).toBe("active-gap");
+		expect(
+			resolveActiveSessionLookupFailure({
+				type: "response",
+				command: "get_state",
+				success: false,
+				error: "Unknown active session: active-gap",
+			}),
+		).toBeUndefined();
+		expect(
+			resolveActiveSessionLookupFailure({
+				type: "response",
+				command: "get_state",
+				success: false,
+				error: "socket closed",
+			}),
+		).toBeInstanceOf(Error);
 	});
 });
 

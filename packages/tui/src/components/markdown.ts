@@ -165,6 +165,13 @@ export interface MarkdownTheme {
 	mathBlock?: (text: string) => string;
 }
 
+export interface MarkdownOptions {
+	/** Transform source Markdown before parsing, with the exact width available for content. */
+	transform?: (markdown: string, availableWidth: number) => string;
+	/** Base URL for relative link targets. Directory URLs must end with a slash. */
+	baseUrl?: string;
+}
+
 interface InlineStyleContext {
 	applyText: (text: string) => string;
 	stylePrefix: string;
@@ -176,6 +183,7 @@ export class Markdown implements Component {
 	private paddingY: number; // Top/bottom padding
 	private defaultTextStyle?: DefaultTextStyle;
 	private theme: MarkdownTheme;
+	private options: MarkdownOptions;
 	private defaultStylePrefix?: string;
 
 	private cachedText?: string;
@@ -194,12 +202,14 @@ export class Markdown implements Component {
 		paddingY: number,
 		theme: MarkdownTheme,
 		defaultTextStyle?: DefaultTextStyle,
+		options?: MarkdownOptions,
 	) {
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
 		this.theme = theme;
 		this.defaultTextStyle = defaultTextStyle;
+		this.options = options ? { ...options } : {};
 	}
 
 	setText(text: string): void {
@@ -228,8 +238,9 @@ export class Markdown implements Component {
 		}
 
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
 
-		if (!this.text || this.text.trim() === "") {
+		if (!text || text.trim() === "") {
 			const result: string[] = [];
 			this.selectionRegions = [];
 			this.cachedText = this.text;
@@ -238,7 +249,7 @@ export class Markdown implements Component {
 			return result;
 		}
 
-		const normalizedText = this.text.replace(/\t/g, "   ");
+		const normalizedText = text.replace(/\t/g, "   ");
 
 		// Parse markdown to HTML-like tokens
 		const tokens = pickMarkdownParser(normalizedText).lexer(normalizedText);
@@ -416,7 +427,6 @@ export class Markdown implements Component {
 		switch (token.type) {
 			case "heading": {
 				const headingLevel = token.depth;
-				const headingPrefix = `${"#".repeat(headingLevel)} `;
 
 				// Build a heading-specific style context so inline tokens (codespan, bold, etc.)
 				// restore heading styling after their own ANSI resets instead of falling back to
@@ -424,6 +434,10 @@ export class Markdown implements Component {
 				let headingStyleFn: (text: string) => string;
 				if (headingLevel === 1) {
 					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(this.theme.underline(text)));
+				} else if (headingLevel >= 5) {
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.italic(text));
+				} else if (headingLevel === 4) {
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(this.theme.italic(text)));
 				} else {
 					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(text));
 				}
@@ -434,8 +448,7 @@ export class Markdown implements Component {
 				};
 
 				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
-				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
-				lines.push(styledHeading);
+				lines.push(headingText);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)
 				}
@@ -602,9 +615,17 @@ export class Markdown implements Component {
 					const linkText = this.renderInlineTokens(token.tokens || [], resolvedStyleContext);
 					const styledLink = this.theme.link(this.theme.underline(linkText));
 					if (getCapabilities().hyperlinks) {
+						// A Windows drive letter is a file path, not a URL scheme.
+						const target = token.href.replace(/^([a-z]:[\\/])/i, "file:///$1");
+						const href =
+							!target.startsWith("#") &&
+							(this.options.baseUrl || target !== token.href) &&
+							URL.canParse(target, this.options.baseUrl)
+								? new URL(target, this.options.baseUrl).href
+								: target;
 						// OSC 8: render as a clickable hyperlink. The URL is not printed inline,
 						// so we always show only the link text regardless of whether it matches href.
-						result += hyperlink(styledLink, token.href) + stylePrefix;
+						result += hyperlink(styledLink, href) + stylePrefix;
 					} else {
 						// Compare raw token.text (not styled) against href for the equality check.
 						// For mailto: links strip the prefix (autolinked emails use text="foo@bar.com"

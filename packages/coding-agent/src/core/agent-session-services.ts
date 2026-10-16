@@ -16,6 +16,7 @@ import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
 import type { SubagentRuntimeHost } from "./rlm-runtime.js";
 import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
+import { semanticEdgeLedgerPath } from "./semantic-edges.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
@@ -41,6 +42,12 @@ export interface CreateAgentSessionServicesOptions {
 	 */
 	noBuiltinHerdrReporter?: boolean;
 	telemetryDisabled?: true;
+	/**
+	 * Hold the telemetry disclosure back on a first interactive launch, where it
+	 * would land on the onboarding screen. Onboarding marks itself shown, so the
+	 * notice appears on the next launch; sessions that never onboard disclose now.
+	 */
+	deferTelemetryNoticeForOnboarding?: boolean;
 }
 
 export interface AgentSessionCreationOptions {
@@ -62,6 +69,8 @@ export interface AgentSessionCreationOptions {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
@@ -142,7 +151,9 @@ export async function createAgentSessionServices(
 ): Promise<AgentSessionServices> {
 	const cwd = options.cwd;
 	const agentDir = options.agentDir ?? getAgentDir();
-	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
+	const authStorage =
+		options.authStorage ??
+		AuthStorage.create(options.agentDir === undefined ? undefined : join(agentDir, "auth.json"));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
@@ -181,6 +192,10 @@ export async function createAgentSessionServices(
 	if (
 		!options.telemetryDisabled &&
 		isTelemetryEnabled(settingsManager) &&
+		// A first interactive launch belongs to onboarding, where the notice would
+		// land on the welcome screen; it surfaces on the next launch once
+		// onboarding marks itself shown. Sessions that never onboard disclose now.
+		(settingsManager.getOnboardingShown() || !options.deferTelemetryNoticeForOnboarding) &&
 		!settingsManager.getTelemetryNoticeShown()
 	) {
 		diagnostics.push({
@@ -223,6 +238,10 @@ export async function createAgentSessionFromServices(
 	installAgentTraceUpload(options.sessionManager, {
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,
+		semanticEdgesLedgerPath: semanticEdgeLedgerPath({
+			rlmSessionDir: options.rlmSessionDir,
+			sessionArtifactDir: options.sessionManager.getSessionArtifactDir(),
+		}),
 	});
 	const result = await createAgentSession({
 		cwd: options.services.cwd,
@@ -251,6 +270,8 @@ export async function createAgentSessionFromServices(
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,

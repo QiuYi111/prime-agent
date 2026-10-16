@@ -15,6 +15,11 @@ import {
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
+import {
+	deriveSemanticEdges,
+	readSemanticEdgeLedger,
+	SEMANTIC_EDGES_LEDGER_FILENAME,
+} from "../../src/core/semantic-edges.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type {
 	ExtensionAPI,
@@ -24,6 +29,8 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.js";
+import { createDefaultRuntimeFactory } from "../../src/main.js";
+import { conversationMessages } from "./harness.js";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -416,6 +423,123 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.deleteRlmSubagentRuntime("parent-agent-child", childRuntime.session);
 	});
 
+	it("plumbs semantic-edge ancestry into runtime-created child ledgers", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const spawnedByRequestId = "a".repeat(32);
+		const sessionDir = join(tempDir, "lineage-child");
+		const childRuntime = await runtime.createRlmSubagentRuntime({
+			parentSession: runtime.session,
+			id: "lineage-child",
+			prompt: "carry ancestry",
+			sessionName: "lineage-worker",
+			sessionDir,
+			model: runtime.session.model!,
+			thinkingLevel: "off",
+			serviceTier: null,
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 2,
+			rlmParentNodeId: "lineage-child",
+			spawnedByRequestId,
+		});
+
+		expect(readSemanticEdgeLedger(join(sessionDir, SEMANTIC_EDGES_LEDGER_FILENAME))[0]).toMatchObject({
+			type: "session_registered",
+			parent_session_id: runtime.session.sessionId,
+			spawned_by_request_id: spawnedByRequestId,
+		});
+		await runtime.deleteRlmSubagentRuntime("lineage-child", childRuntime.session);
+	});
+
+	it("keeps semantic spawn lineage through the production runtime factory", async () => {
+		const tempDir = join(tmpdir(), `pi-runtime-factory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		vi.stubEnv("HOME", tempDir);
+		cleanups.push(() => {
+			vi.unstubAllEnvs();
+		});
+		mkdirSync(tempDir, { recursive: true });
+		cleanups.push(() => rmSync(tempDir, { recursive: true, force: true }));
+		const faux = registerFauxProvider({ models: [{ id: "faux-1", reasoning: false }] });
+		cleanups.push(() => faux.unregister());
+
+		// The PRODUCTION factory (daemon workers and runtime hosts create every
+		// session through it), not a test factory that forwards all options: the
+		// original defect lived in its sessionOptions whitelist and stayed
+		// invisible to factory-boundary assertions.
+		const factory = createDefaultRuntimeFactory(
+			{
+				agentDir: tempDir,
+				cwd: tempDir,
+				sessionDir: join(tempDir, "sessions"),
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				telemetryDisabled: true,
+			},
+			[
+				(pi: ExtensionAPI) => {
+					pi.registerProvider(faux.getModel().provider, {
+						baseUrl: faux.getModel().baseUrl,
+						apiKey: "faux-key",
+						api: faux.api,
+						models: faux.models.map((registeredModel) => ({
+							id: registeredModel.id,
+							name: registeredModel.name,
+							api: registeredModel.api,
+							reasoning: registeredModel.reasoning,
+							input: registeredModel.input,
+							cost: registeredModel.cost,
+							contextWindow: registeredModel.contextWindow,
+							maxTokens: registeredModel.maxTokens,
+						})),
+					});
+				},
+			],
+		);
+
+		const childSessionDir = join(tempDir, "lineage-child");
+		const spawnedByRequestId = "a".repeat(32);
+		const created = await factory({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.create(tempDir, childSessionDir),
+			sessionStartEvent: { type: "session_start", reason: "startup" },
+			sessionOptions: {
+				model: faux.getModel(),
+				thinkingLevel: "off",
+				rlmDepth: 1,
+				rlmMaxDepth: 2,
+				rlmSessionDir: childSessionDir,
+				rlmParentNodeId: "lineage-child",
+				rlmParentAgent: "parent-worker",
+				semanticParentSessionId: "parent-session-id",
+				semanticSpawnedByRequestId: spawnedByRequestId,
+			},
+		});
+		cleanups.push(() => created.session.dispose());
+		expect(created.services.modelRegistry.authStorage).toBe(created.services.authStorage);
+		expect(created.services.authStorage.getPrimeCliConfigPath()).toBe(join(tempDir, ".prime", "config.json"));
+		await created.session.bindExtensions({});
+
+		const ledgerPath = join(childSessionDir, SEMANTIC_EDGES_LEDGER_FILENAME);
+		expect(readSemanticEdgeLedger(ledgerPath)[0]).toMatchObject({
+			type: "session_registered",
+			parent_session_id: "parent-session-id",
+			spawned_by_request_id: spawnedByRequestId,
+		});
+
+		faux.setResponses([fauxAssistantMessage("child work")]);
+		await created.session.prompt("do the work");
+		const edges = deriveSemanticEdges([readSemanticEdgeLedger(ledgerPath)]).edges;
+		expect(edges.filter((edge) => edge.type === "subagent_call")).toMatchObject([
+			{ source_request_id: spawnedByRequestId },
+		]);
+	});
+
 	it("disposes hosted RLM children during session replacement", async () => {
 		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
 		const host: SubagentRuntimeHost = {
@@ -499,7 +623,7 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(newSessionResult.cancelled).toBe(false);
 		await runtime.session.bindExtensions({});
 		expect(runtime.session).not.toBe(originalSession);
-		expect(runtime.session.messages).toEqual([]);
+		expect(conversationMessages(runtime.session)).toEqual([]);
 		const secondSessionFile = runtime.session.sessionFile;
 		expect(events).toEqual([
 			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
@@ -613,7 +737,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(result).toEqual({ cancelled: false, selectedText: "Say two" });
 		expect(
-			runtime.session.messages.map((message) =>
+			conversationMessages(runtime.session).map((message) =>
 				message.role === "user"
 					? typeof message.content === "string"
 						? message.content
@@ -635,7 +759,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const result = await runtime.fork(userMessages[0]!.entryId);
 
 		expect(result).toEqual({ cancelled: false, selectedText: "Say one" });
-		expect(runtime.session.messages).toEqual([]);
+		expect(conversationMessages(runtime.session)).toEqual([]);
 		expect(runtime.session.sessionFile).toBeUndefined();
 	});
 
@@ -644,7 +768,7 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.prompt("hello");
 		await runtime.session.prompt("again");
 
-		const beforeMessages = runtime.session.messages.map((message) => ({
+		const beforeMessages = conversationMessages(runtime.session).map((message) => ({
 			role: message.role,
 			text:
 				message.role === "user"
@@ -664,7 +788,7 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(result).toEqual({ cancelled: false, selectedText: undefined });
 		expect(runtime.session.sessionFile).not.toBe(previousSessionFile);
 		expect(
-			runtime.session.messages.map((message) => ({
+			conversationMessages(runtime.session).map((message) => ({
 				role: message.role,
 				text:
 					message.role === "user"
@@ -685,7 +809,7 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.prompt("hello");
 		await runtime.session.prompt("again");
 
-		const beforeMessages = runtime.session.messages.map((message) => ({
+		const beforeMessages = conversationMessages(runtime.session).map((message) => ({
 			role: message.role,
 			text:
 				message.role === "user"
@@ -705,7 +829,7 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(result).toEqual({ cancelled: false, selectedText: undefined });
 		expect(runtime.session.sessionFile).toBeUndefined();
 		expect(
-			runtime.session.messages.map((message) => ({
+			conversationMessages(runtime.session).map((message) => ({
 				role: message.role,
 				text:
 					message.role === "user"

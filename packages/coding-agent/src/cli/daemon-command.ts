@@ -3,16 +3,17 @@ import { clearLine, createInterface, cursorTo, type Interface } from "node:readl
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { spawn } from "child_process";
 import { expandTildePath } from "../config.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
+import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { spawnHidden } from "../utils/child-process.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
@@ -293,6 +294,11 @@ async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
 		const data = requireSuccess(response);
 		if (!isLiveSessionSummary(data)) {
 			throw new Error("Daemon returned an invalid create response");
+		}
+		if (parsed.json) {
+			// Machine-readable open has no terminal to attach; match create's --json shape.
+			printJson(data);
+			return;
 		}
 		await runAttach(client, data.activeSessionId);
 	} finally {
@@ -621,10 +627,6 @@ function parseExtensionFlagOption(
 	return { consumed: 0, daemonArg: arg };
 }
 
-function looksLikeSessionPath(value: string): boolean {
-	return value.includes("/") || value.includes("\\") || value.endsWith(".jsonl");
-}
-
 function requireOptionValue(args: string[], index: number, option: string): string {
 	const value = args[index + 1];
 	if (!value) {
@@ -691,7 +693,7 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 		parsed.socketPath,
 		...sessionArgs.daemonArgs.filter((arg) => arg !== "--background" && arg !== "-d"),
 	];
-	const child = spawn(process.execPath, daemonArgs, {
+	const child = spawnHidden(process.execPath, daemonArgs, {
 		cwd: sessionArgs.config?.cwd ?? process.cwd(),
 		detached: true,
 		env: process.env,
@@ -800,6 +802,10 @@ async function runCreate(client: DaemonClient, args: string[], json: boolean): P
 }
 
 async function runAttach(client: DaemonClient, activeSessionId: string): Promise<void> {
+	if (!process.stdin.isTTY) {
+		// The attach terminal reads stdin; without a TTY it would hang forever.
+		throw new Error("attach requires an interactive terminal (pass --json for machine-readable attach)");
+	}
 	const terminal = new DaemonAttachTerminal(client, activeSessionId);
 	await terminal.run();
 }

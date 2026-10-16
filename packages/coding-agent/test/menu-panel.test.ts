@@ -1,4 +1,5 @@
 import { type Component, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
+import chalk from "chalk";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
@@ -46,6 +47,45 @@ describe("MenuPanel", () => {
 		}
 	});
 
+	it("renders an optional top rule above inline panels", () => {
+		const createPanel = (topRule: boolean): MenuPanel => {
+			const panel = new MenuPanel({ title: "Login to Provider", inline: true, topRule });
+			panel.addChild(new StaticComponent());
+			return panel;
+		};
+
+		const withRule = createPanel(true).render(24);
+		expect(withRule[0]).toContain(theme.getFgAnsi("borderMuted"));
+		expect(stripAnsi(withRule[0] ?? "")).toBe("─".repeat(24));
+		expect(stripAnsi(withRule[1] ?? "").trim()).toBe("Login to Provider");
+		for (const line of withRule) {
+			expect(visibleWidth(line)).toBe(24);
+		}
+
+		const withoutRule = createPanel(false).render(24);
+		expect(stripAnsi(withoutRule[0] ?? "").trim()).toBe("Login to Provider");
+		expect(withoutRule.join("")).not.toContain("─");
+	});
+
+	it("renders the subtitle under the title in inline panels", () => {
+		const panel = new MenuPanel({
+			title: "Choose an account",
+			subtitle: "Sign in with the account you want to use.",
+			inline: true,
+		});
+		panel.addChild(new StaticComponent());
+
+		const lines = panel.render(60);
+		const output = lines.map((line) => stripAnsi(line));
+
+		expect(output[0]?.trim()).toBe("Choose an account");
+		expect(output[1]?.trim()).toBe("Sign in with the account you want to use.");
+		expect(output[2]?.trim()).toBe("first");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBe(60);
+		}
+	});
+
 	it("renders search fields without the shell prompt", () => {
 		const field = new MenuSearchInput("Search models");
 		const output = stripAnsi(field.render(24).join("\n"));
@@ -86,6 +126,28 @@ describe("MenuPanel", () => {
 		expect(stripAnsi(lines.at(-1) ?? "").trim()).toBe("");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(40);
+		}
+	});
+
+	it("renders selected rows with a bold non-accent primary and a soft highlight", () => {
+		const previousChalkLevel = chalk.level;
+		chalk.level = 3;
+		try {
+			const fullRow = new MenuRow({ primary: "openai/gpt-5", secondary: "openai", selected: true });
+			const fullOutput = fullRow.render(40).join("\n");
+			expect(stripAnsi(fullOutput)).toContain("openai/gpt-5");
+			expect(fullOutput).toContain("\x1b[1m");
+			expect(fullOutput).not.toContain(theme.getFgAnsi("accent"));
+			expect(fullOutput).toContain(theme.getBgAnsi("selectedBg"));
+
+			const inlineRow = new MenuRow({ primary: "GPT 5.5", trailing: ["openai"], selected: true, inline: true });
+			const inlineOutput = inlineRow.renderContent(80).join("\n");
+			expect(stripAnsi(inlineOutput)).toContain("GPT 5.5");
+			expect(inlineOutput).toContain("\x1b[1m");
+			expect(inlineOutput).not.toContain(theme.getFgAnsi("accent"));
+			expect(inlineOutput).toContain(theme.getBgAnsi("selectedBg"));
+		} finally {
+			chalk.level = previousChalkLevel;
 		}
 	});
 

@@ -97,7 +97,7 @@ export class UserMessageSelectorComponent extends Container {
 		super();
 
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.bold("Fork from Message"), 1, 0));
+		this.addChild(new Text("Fork from Message", 1, 0));
 		this.addChild(
 			new Text(
 				theme.fg("muted", "Select a user message to copy the active path up to that point into a new session"),
@@ -117,10 +117,6 @@ export class UserMessageSelectorComponent extends Container {
 
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
-
-		if (messages.length === 0) {
-			setTimeout(() => onCancel(), 100);
-		}
 	}
 
 	getMessageList(): UserMessageList {

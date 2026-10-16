@@ -11,7 +11,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
-import type { WarningSettings } from "../../../core/settings-manager.js";
+import type { MermaidRenderingMode, WarningSettings } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
@@ -45,7 +45,7 @@ export interface SettingsConfig {
 	availableThinkingLevels: ThinkingLevel[];
 	currentTheme: string;
 	availableThemes: string[];
-	hideThinkingBlock: boolean;
+	mermaidRenderingMode: MermaidRenderingMode;
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
@@ -71,7 +71,7 @@ export interface SettingsCallbacks {
 	onThinkingLevelChange: (level: ThinkingLevel) => void;
 	onThemeChange: (theme: string) => void;
 	onThemePreview?: (theme: string) => void;
-	onHideThinkingBlockChange: (hidden: boolean) => void;
+	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
@@ -140,7 +140,7 @@ class SelectSubmenu extends Container {
 	) {
 		super();
 
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		this.addChild(new Text(theme.fg("accent", title), 0, 0));
 
 		if (description) {
 			this.addChild(new Spacer(1));
@@ -236,11 +236,11 @@ export class SettingsSelectorComponent extends Container {
 				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
-				id: "hide-thinking",
-				label: "Hide thinking",
-				description: "Hide thinking blocks in assistant responses",
-				currentValue: config.hideThinkingBlock ? "true" : "false",
-				values: ["true", "false"],
+				id: "mermaid-rendering",
+				label: "Mermaid diagrams",
+				description: "Render Mermaid code blocks as Unicode diagrams",
+				currentValue: config.mermaidRenderingMode,
+				values: ["off", "final", "streaming"],
 			},
 			{
 				id: "quiet-startup",
@@ -469,8 +469,8 @@ export class SettingsSelectorComponent extends Container {
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);
 						break;
-					case "hide-thinking":
-						callbacks.onHideThinkingBlockChange(newValue === "true");
+					case "mermaid-rendering":
+						callbacks.onMermaidRenderingModeChange(newValue as MermaidRenderingMode);
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "true");

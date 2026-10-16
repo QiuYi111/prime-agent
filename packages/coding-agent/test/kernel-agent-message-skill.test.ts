@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import { KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import { type KernelSentAgentMessage, ReplKernelManager } from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
@@ -40,18 +40,11 @@ describe("agent-message skill over the kernel host bridge", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("lists agents and sends without exposing a spoofable sender", async () => {
+	it("sends without exposing a spoofable sender and rejects the removed roster call", async () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
-				"agent_message.list_agents": async (payload) => {
-					requests.push({ type: "agent_message.list_agents", payload });
-					return {
-						current: { name: "alpha", id: "session-alpha", depth: 0 },
-						entries: [{ relationship: "sibling", name: "Beta", id: "session-beta", depth: 0, status: "idle" }],
-					};
-				},
 				"agent_message.send": async (payload) => {
 					requests.push({ type: "agent_message.send", payload });
 					return {
@@ -70,19 +63,15 @@ describe("agent-message skill over the kernel host bridge", () => {
 		const manager = await provisioner.ensure();
 		const result = await manager.execute(`
 import json
-agents = await agent_message.list_agents()
 receipt = await agent_message.send(
     "hello beta", receiver_role="sibling", receiver_name="beta"
 )
-print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
+print(json.dumps({"has_list_agents": hasattr(agent_message, "list_agents"), "receipt": receipt}, sort_keys=True))
 `);
 
 		expect(result.status).toBe("ok");
 		const output = JSON.parse(result.stdout.trim());
-		expect(output.agents).toMatchObject({
-			current: { id: "session-alpha", depth: 0 },
-			entries: [{ relationship: "sibling", id: "session-beta", status: "idle" }],
-		});
+		expect(output.has_list_agents).toBe(false);
 		expect(output.receipt).toMatchObject({
 			id: "agentmsg-test",
 			source: "agent_message",
@@ -99,10 +88,6 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 			},
 		]);
 		expect(requests[0]).toMatchObject({
-			type: "agent_message.list_agents",
-			payload: { type: "agent_message.list_agents" },
-		});
-		expect(requests[1]).toMatchObject({
 			type: "agent_message.send",
 			payload: {
 				type: "agent_message.send",
@@ -111,7 +96,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 				receiver_name: "beta",
 			},
 		});
-		expect(requests[1].payload).not.toHaveProperty("from");
+		expect(requests[0].payload).not.toHaveProperty("from");
 	});
 
 	it("emits successful broadcast receipts and leaves short errors in the result", async () => {
@@ -266,7 +251,7 @@ background_send = asyncio.create_task(send_later())`,
 	});
 
 	it("bounds retained handlers for late sent messages", async () => {
-		const manager = new KernelManager({ cwd: tempDir });
+		const manager = new ReplKernelManager({ cwd: tempDir });
 		const host = manager as unknown as LateHandlerRetentionHost;
 		const handler = () => {};
 
@@ -277,6 +262,6 @@ background_send = asyncio.create_task(send_later())`,
 		expect(host.lateSentAgentMessageHandlers.size).toBe(256);
 		expect(host.lateSentAgentMessageHandlers.has("request-0")).toBe(false);
 		expect(host.lateSentAgentMessageHandlers.has("request-299")).toBe(true);
-		await manager.dispose();
+		await manager.shutdown({ snapshot: true, drainHostRequests: true });
 	});
 });

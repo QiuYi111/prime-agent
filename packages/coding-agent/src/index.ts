@@ -87,6 +87,8 @@ export type {
 	InputEventResult,
 	InputSource,
 	IpythonToolCallEvent,
+	KernelHostRequestHandler,
+	KernelHostRequestRegistration,
 	KeybindingsManager,
 	LoadExtensionsResult,
 	MessageRenderer,
@@ -142,6 +144,7 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.js";
 export { convertToLlm } from "./core/messages.js";
 export { ModelRegistry } from "./core/model-registry.js";
+export { startDelegatedProviderBroker, type DelegatedProviderBrokerOptions } from "./core/delegated-provider-broker.js";
 export type {
 	PackageManager,
 	PathMetadata,

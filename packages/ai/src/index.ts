@@ -2,9 +2,11 @@ export type { Static, TSchema } from "typebox";
 export { Type } from "typebox";
 
 export * from "./api-registry.js";
+export * from "./delegated-provider.js";
 export * from "./env-api-keys.js";
 export * from "./log.js";
 export * from "./models.js";
+export * from "./prime-inference-model-catalog.js";
 export type { BedrockOptions, BedrockThinkingDisplay } from "./providers/amazon-bedrock.js";
 export type { AnthropicEffort, AnthropicOptions, AnthropicThinkingDisplay } from "./providers/anthropic.js";
 export type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses.js";

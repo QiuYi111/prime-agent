@@ -1,9 +1,13 @@
-import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, VERSION } from "../config.js";
-import { isOrphanProcessIdentityCurrent, readActiveOrphanProcesses } from "../core/orphan-process-journal.js";
+import {
+	isOrphanProcessIdentityCurrent,
+	killOrphanProcess,
+	readActiveOrphanProcesses,
+	shouldReapOrphanProcess,
+} from "../core/orphan-process-journal.js";
 import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import {
@@ -12,22 +16,32 @@ import {
 	type DaemonRuntimeIdentity,
 } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { createDaemonStateRootMatcher } from "../modes/daemon/daemon-state-root.js";
 import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
-import { signalProcessGroupOrProcess } from "../utils/child-process.js";
+import {
+	isProcessAlive,
+	processGroupHasLiveMember,
+	processIdExists,
+	signalProcessGroupIfHeld,
+	spawnSyncHidden,
+} from "../utils/child-process.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 
 /**
- * `daemon ps` discovers every prime-agent daemon on the machine, not just the
- * one on a single socket. Discovery has two sources merged by socket path:
+ * `daemon ps` discovers every prime-agent daemon in *our state root*, not just
+ * the one on a single socket. Discovery has two sources merged by socket path:
  *
  *  1. The OS list of listening unix sockets owned by a prime-agent process
  *     (`ss -lxp` on Linux, `lsof` on macOS). Daemons set process.title to
  *     APP_NAME and carry nothing useful in argv, so the socket→pid mapping the
  *     kernel keeps is the only reliable way to find daemons on arbitrary
  *     `--daemon-socket` paths. This is the same data as `ss -lxp | grep
- *     prime-agent`, just parsed.
+ *     prime-agent`, just parsed. The kernel list is machine-wide, so it is
+ *     filtered to our state root (see createDaemonStateRootMatcher): a daemon
+ *     started under a different HOME or agent dir is another root's business,
+ *     and stopping it from here would kill unrelated live sessions.
  *  2. A sweep of the default socket dir, which catches orphaned socket *files*
  *     left behind by daemons that are no longer running.
  *
@@ -166,22 +180,33 @@ export function parsePsEtimes(stdout: string): Map<number, number> {
 	return uptimes;
 }
 
+/**
+ * Listening prime-agent daemons that belong to this state root. The OS sweep
+ * behind it sees every daemon the user can observe, including daemons from an
+ * isolated HOME or a different agent dir, so the result is filtered before any
+ * caller can list, signal or reap it.
+ */
 function scanListeningDaemons(): DiscoveredDaemonProcess[] {
+	const belongsToStateRoot = createDaemonStateRootMatcher();
+	return scanAllListeningDaemons().filter((daemon) => belongsToStateRoot(daemon.socketPath));
+}
+
+function scanAllListeningDaemons(): DiscoveredDaemonProcess[] {
 	if (process.platform === "win32") {
 		return [];
 	}
-	const ss = spawnSync("ss", ["-lxp"], { encoding: "utf8" });
+	const ss = spawnSyncHidden("ss", ["-lxp"], { encoding: "utf8" });
 	if (!ss.error && ss.status === 0 && typeof ss.stdout === "string") {
 		return enrichUptimes(parseSsListeners(ss.stdout, APP_NAME));
 	}
-	const lsof = spawnSync("lsof", ["-nP", "-F", "pn", "-U", "-a", "-c", APP_NAME], { encoding: "utf8" });
+	const lsof = spawnSyncHidden("lsof", ["-nP", "-F", "pn", "-U", "-a", "-c", APP_NAME], { encoding: "utf8" });
 	const byName = !lsof.error && typeof lsof.stdout === "string" ? parseLsofListeners(lsof.stdout) : [];
 	let byPid: DiscoveredDaemonProcess[] = [];
-	const ps = spawnSync("ps", ["-axo", "pid=,comm=,args="], { encoding: "utf8" });
+	const ps = spawnSyncHidden("ps", ["-axo", "pid=,comm=,args="], { encoding: "utf8" });
 	if (!ps.error && ps.status === 0 && typeof ps.stdout === "string") {
 		const pids = parsePrimeAgentProcessIds(ps.stdout, APP_NAME);
 		if (pids.length > 0) {
-			const lsofByPid = spawnSync("lsof", ["-nP", "-F", "pn", "-U", "-a", "-p", pids.join(",")], {
+			const lsofByPid = spawnSyncHidden("lsof", ["-nP", "-F", "pn", "-U", "-a", "-p", pids.join(",")], {
 				encoding: "utf8",
 			});
 			if (!lsofByPid.error && typeof lsofByPid.stdout === "string") {
@@ -202,7 +227,7 @@ function enrichUptimes(daemons: DiscoveredDaemonProcess[]): DiscoveredDaemonProc
 	if (pids.length === 0) {
 		return daemons;
 	}
-	const ps = spawnSync("ps", ["-o", "pid=,etimes=", "-p", pids.join(",")], { encoding: "utf8" });
+	const ps = spawnSyncHidden("ps", ["-o", "pid=,etimes=", "-p", pids.join(",")], { encoding: "utf8" });
 	if (ps.error || typeof ps.stdout !== "string") {
 		return daemons;
 	}
@@ -333,7 +358,7 @@ export function verifyHelloSupervisorPid(
 	return pid;
 }
 
-/** Discover every daemon on the machine and probe each for version + session count. */
+/** Discover every daemon in this state root and probe each for version + session count. */
 export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	const processBySocket = new Map<string, DiscoveredDaemonProcess>();
 	for (const daemon of scanListeningDaemons()) {
@@ -798,7 +823,7 @@ function recordResidualListenerFailures(
 	}
 }
 function describeDaemonParent(pid: number): string {
-	const result = spawnSync("ps", ["-o", "ppid=,tty=,command=", "-p", String(pid)], { encoding: "utf8" });
+	const result = spawnSyncHidden("ps", ["-o", "ppid=,tty=,command=", "-p", String(pid)], { encoding: "utf8" });
 	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
 		return "";
 	}
@@ -938,7 +963,26 @@ async function forceStopTrackedWorkers(
 				failures.push(`could not read child process records for worker ${descriptor.workerId}: ${String(error)}`);
 			}
 			for (const orphan of orphans) {
+				// Pid-only records go through the platform predicate (stopTrackedProcess needs a startId).
+				if (orphan.processStartId === undefined) {
+					if (shouldReapOrphanProcess(orphan)) {
+						killOrphanProcess(orphan.pid);
+					}
+					continue;
+				}
 				if (!isOrphanProcessIdentityCurrent(orphan)) {
+					continue;
+				}
+				if (process.platform === "win32") {
+					// taskkill /T, like the sibling reapers: signalling only the shell pid leaves its descendants alive.
+					await assertAdmission();
+					if (isOrphanProcessIdentityCurrent(orphan)) {
+						killOrphanProcess(orphan.pid);
+						if (isProcessAlive(orphan.pid)) {
+							cleanupWorkerRecords = false;
+							failures.push(`could not stop child process ${orphan.pid} for worker ${descriptor.workerId}`);
+						}
+					}
 					continue;
 				}
 				if (!(await stopTrackedProcess(orphan.pid, orphan.processStartId, assertAdmission))) {
@@ -1037,34 +1081,47 @@ async function stopTrackedProcess(
 	expectedStartId: string | undefined,
 	assertAdmission: () => Promise<void>,
 ): Promise<boolean> {
-	if (!isProcessAlive(pid)) {
+	if (trackedProcessStopped(pid)) {
 		return true;
 	}
-	if (!expectedStartId || getProcessStartId(pid) !== expectedStartId) {
+	if (!expectedStartId || !trackedLeaderIdentityCurrent(pid, expectedStartId)) {
 		return false;
 	}
 	await assertAdmission();
-	if (getProcessStartId(pid) !== expectedStartId) {
+	if (!trackedLeaderIdentityCurrent(pid, expectedStartId)) {
 		return false;
 	}
-	signalProcessGroupOrProcess(pid, "SIGTERM");
+	signalProcessGroupIfHeld(pid, "SIGTERM");
 	let deadline = Date.now() + 500;
-	while (isProcessAlive(pid) && Date.now() < deadline) {
+	while (!trackedProcessStopped(pid) && Date.now() < deadline) {
 		await delay(25);
 	}
-	if (!isProcessAlive(pid)) {
+	if (trackedProcessStopped(pid)) {
 		return true;
 	}
 	await assertAdmission();
-	if (getProcessStartId(pid) !== expectedStartId) {
+	if (!trackedLeaderIdentityCurrent(pid, expectedStartId)) {
 		return false;
 	}
-	signalProcessGroupOrProcess(pid, "SIGKILL");
+	signalProcessGroupIfHeld(pid, "SIGKILL");
 	deadline = Date.now() + 1000;
-	while (isProcessAlive(pid) && Date.now() < deadline) {
+	while (!trackedProcessStopped(pid) && Date.now() < deadline) {
 		await delay(25);
 	}
-	return !isProcessAlive(pid);
+	return trackedProcessStopped(pid);
+}
+
+/** A GROUP stop completes when the leader is gone AND no live member remains; unreaped zombies do not block it. */
+function trackedProcessStopped(pid: number): boolean {
+	return !isProcessAlive(pid) && !processGroupHasLiveMember(pid);
+}
+
+/** Identity gates guard pid reuse, so they apply only while the leader exists; a pgid cannot be reused while members hold it. */
+function trackedLeaderIdentityCurrent(pid: number, expectedStartId: string): boolean {
+	if (!processIdExists(pid)) {
+		return true;
+	}
+	return getProcessStartId(pid) === expectedStartId;
 }
 
 export async function runReap(json: boolean, force: boolean): Promise<void> {
@@ -1193,15 +1250,6 @@ async function forceKillDaemon(pid: number): Promise<void> {
 		process.kill(pid, "SIGKILL");
 	} catch {
 		// Process already exited between the liveness check and the kill.
-	}
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 

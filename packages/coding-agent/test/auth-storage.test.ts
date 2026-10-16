@@ -1,11 +1,41 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { AuthStorage } from "../src/core/auth-storage.js";
-import { clearConfigValueCache } from "../src/core/resolve-config-value.js";
+import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.js";
+
+const initialWriteFault = vi.hoisted(() => ({ count: -1 }));
+const renameFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+const absenceIllusion = vi.hoisted(() => ({ paths: new Set<string>() }));
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		writeSync: ((fd: number, data: NodeJS.ArrayBufferView | string, offset?: number, length?: number) => {
+			if (initialWriteFault.count >= 0) {
+				const count = initialWriteFault.count;
+				initialWriteFault.count = -1;
+				if (count === 0) return 0;
+				const bytes =
+					typeof data === "string"
+						? Buffer.from(data)
+						: Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+				return actual.writeSync(fd, bytes, offset ?? 0, count);
+			}
+			return actual.writeSync(fd, data as never, offset as never, length as never);
+		}) as typeof actual.writeSync,
+		renameSync: (from: Parameters<typeof actual.renameSync>[0], to: Parameters<typeof actual.renameSync>[1]) => {
+			if (renameFault.error && String(to).endsWith("auth.json")) throw renameFault.error;
+			return actual.renameSync(from, to);
+		},
+		existsSync: (path: Parameters<typeof actual.existsSync>[0]) => {
+			if (absenceIllusion.paths.has(String(path))) return false;
+			return actual.existsSync(path);
+		},
+	};
+});
 
 describe("AuthStorage", () => {
 	let tempDir: string;
@@ -22,7 +52,6 @@ describe("AuthStorage", () => {
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
-		clearConfigValueCache();
 		vi.restoreAllMocks();
 	});
 
@@ -193,105 +222,6 @@ describe("AuthStorage", () => {
 			expect(apiKey).toBe("literal_api_key_value");
 		});
 
-		test("prime inference falls back to Prime CLI config when enabled", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
-			expect(authStorage.hasAuth("prime-inference")).toBe(true);
-			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "prime_cli",
-				label: "Prime CLI",
-			});
-		});
-
-		test("prime cli config changes are picked up without reload", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "changed-prime-key" }));
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
-		});
-
-		test("prime inference marks current Prime CLI auth stale", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(authStorage.markAuthStale("prime-inference")).toBe(true);
-
-			expect(authStorage.hasAuth("prime-inference")).toBe(false);
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
-			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "stale",
-				label: "expired",
-			});
-		});
-
-		test("changed Prime CLI key no longer matches stale auth marker", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-			authStorage.markAuthStale("prime-inference");
-
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "changed-prime-key" }));
-
-			expect(authStorage.hasAuth("prime-inference")).toBe(true);
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
-			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "prime_cli",
-				label: "Prime CLI",
-			});
-		});
-
-		test("setPrimeInferenceApiKey clears stale Prime CLI auth marker", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-			authStorage.markAuthStale("prime-inference");
-
-			authStorage.setPrimeInferenceApiKey("new-prime-key");
-
-			expect(authStorage.hasAuth("prime-inference")).toBe(true);
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("new-prime-key");
-			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "prime_cli",
-				label: "Prime CLI",
-			});
-		});
-
 		test("stored credential updates do not revive stale runtime auth", async () => {
 			authStorage = AuthStorage.inMemory();
 			authStorage.setRuntimeApiKey("anthropic", "runtime-key");
@@ -333,454 +263,294 @@ describe("AuthStorage", () => {
 			expect(authStorage.getAuthStatus("anthropic")).toEqual({ configured: true, source: "stored" });
 		});
 
-		test("prime inference uses Prime CLI auth over stored auth", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-				},
-			});
+		describe("Prime Inference isolation", () => {
+			let primeConfigPath: string;
+			const team = { teamId: "agent-team", name: "Agent Research", role: "admin" };
 
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
-			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "prime_cli",
-				label: "Prime CLI",
-			});
-		});
-
-		test("prime inference uses environment auth over Prime CLI and stored auth", async () => {
-			const originalPrimeApiKey = process.env.PRIME_API_KEY;
-			const originalPrimeTeamId = process.env.PRIME_TEAM_ID;
-			process.env.PRIME_API_KEY = "env-prime-key";
-			delete process.env.PRIME_TEAM_ID;
-			try {
-				const primeConfigPath = join(tempDir, "prime-config.json");
+			beforeEach(() => {
+				vi.stubEnv("PRIME_API_KEY", undefined);
+				vi.stubEnv("PRIME_TEAM_ID", undefined);
+				primeConfigPath = join(tempDir, "prime-config.json");
 				writeFileSync(
 					primeConfigPath,
-					JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team", team_name: "CLI Research" }),
+					JSON.stringify({ api_key: "cli-key", team_id: "cli-team", base_url: "http://localhost:8000" }),
 				);
-				writeAuthJson({
-					"prime-inference": {
-						type: "api_key",
-						key: "agent-key",
-						primeTeam: { teamId: "stored-team", name: "Stored Research" },
-					},
-				});
+			});
 
-				authStorage = AuthStorage.create(authJsonPath, {
+			afterEach(() => {
+				vi.unstubAllEnvs();
+			});
+
+			function createStorage() {
+				return AuthStorage.create(authJsonPath, {
 					primeCliConfigPath: primeConfigPath,
 					usePrimeCliConfig: true,
 				});
+			}
 
-				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("env-prime-key");
+			test("CLI-only credentials never count as Agent auth", async () => {
+				authStorage = createStorage();
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+				expect(authStorage.hasAuth("prime-inference")).toBe(false);
+				expect(authStorage.getAuthStatus("prime-inference")).toEqual({ configured: false });
+				expect(authStorage.getCurrentAuthSourceToken("prime-inference")).toBeUndefined();
+				expect(authStorage.markAuthStale("prime-inference")).toBe(false);
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
+			});
+
+			test("stored auth and team survive CLI edits, corruption, removal, and Agent reload", async () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+
+				for (const config of [
+					JSON.stringify({ api_key: "new-cli-key", team_id: "new-cli-team" }),
+					"{invalid-json",
+					undefined,
+				]) {
+					if (config === undefined) rmSync(primeConfigPath);
+					else writeFileSync(primeConfigPath, config);
+					authStorage.reload();
+					await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("agent-key");
+					expect(authStorage.getAuthStatus("prime-inference")).toEqual({ configured: true, source: "stored" });
+					expect(authStorage.getPrimeInferenceTeamSelection()).toEqual(team);
+					expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": team.teamId });
+					expect(authStorage.drainErrors()).toEqual([]);
+				}
+			});
+
+			test("runtime, environment, stored, and models fallback resolve in order without CLI", async () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+				authStorage.setFallbackResolver(() => "models-key");
+				vi.stubEnv("PRIME_API_KEY", "env-key");
+				authStorage.setRuntimeApiKey("prime-inference", "runtime-key");
+
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("runtime-key");
+				expect(authStorage.getAuthStatus("prime-inference").source).toBe("runtime");
+				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+				authStorage.removeRuntimeApiKey("prime-inference");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("env-key");
 				expect(authStorage.getAuthStatus("prime-inference")).toEqual({
 					configured: false,
 					source: "environment",
 					label: "PRIME_API_KEY",
 				});
-				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
 				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
-			} finally {
-				if (originalPrimeApiKey === undefined) {
-					delete process.env.PRIME_API_KEY;
-				} else {
-					process.env.PRIME_API_KEY = originalPrimeApiKey;
-				}
-				if (originalPrimeTeamId === undefined) {
-					delete process.env.PRIME_TEAM_ID;
-				} else {
-					process.env.PRIME_TEAM_ID = originalPrimeTeamId;
-				}
-			}
-		});
-
-		test("prime inference provider headers use selected Prime CLI team", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(
-				primeConfigPath,
-				JSON.stringify({
-					api_key: "prime-cli-key",
-					team_id: "cli-team",
-					team_name: "CLI Research",
-					team_role: "admin",
-				}),
-			);
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: { teamId: "team-1", name: "Research", slug: "research", role: "admin" },
-				},
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+				vi.stubEnv("PRIME_API_KEY", undefined);
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("agent-key");
+				expect(authStorage.getAuthStatus("prime-inference").source).toBe("stored");
+				authStorage.remove("prime-inference");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("models-key");
+				expect(authStorage.getAuthStatus("prime-inference").source).toBe("fallback");
+				await expect(authStorage.getApiKey("prime-inference", { includeFallback: false })).resolves.toBeUndefined();
 			});
 
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
+			test.each([undefined, null])("missing or personal Agent team never inherits CLI team (%j)", (primeTeam) => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam } });
+				authStorage = createStorage();
+				expect(authStorage.getPrimeInferenceTeamSelection()).toBe(primeTeam);
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
 			});
 
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "cli-team" });
-			expect(authStorage.getPrimeInferenceTeamSelection()).toEqual({
-				teamId: "cli-team",
-				name: "CLI Research",
-				role: "admin",
-			});
-		});
-
-		test("prime inference legacy personal selection suppresses Prime CLI team fallback without Prime CLI key", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ team_id: "cli-team" }));
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: null,
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
-			expect(authStorage.getPrimeInferenceTeamSelection()).toBeNull();
-		});
-
-		test("prime inference legacy personal selection suppresses Prime CLI team with Prime CLI key", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team" }));
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: null,
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
-			expect(authStorage.getPrimeInferenceTeamSelection()).toBeNull();
-		});
-
-		test("prime inference environment team overrides legacy personal selection", () => {
-			const originalPrimeTeamId = process.env.PRIME_TEAM_ID;
-			process.env.PRIME_TEAM_ID = "env-team";
-			try {
-				const primeConfigPath = join(tempDir, "prime-config.json");
-				writeFileSync(primeConfigPath, JSON.stringify({ team_id: "cli-team" }));
-				writeAuthJson({
-					"prime-inference": {
-						type: "api_key",
-						key: "agent-key",
-						primeTeam: null,
-					},
-				});
-
-				authStorage = AuthStorage.create(authJsonPath, {
-					primeCliConfigPath: primeConfigPath,
-					usePrimeCliConfig: true,
-				});
-
+			test("PRIME_TEAM_ID overrides headers without changing the stored selection", () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+				vi.stubEnv("PRIME_TEAM_ID", "env-team");
 				expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "env-team" });
 				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
-			} finally {
-				if (originalPrimeTeamId === undefined) {
-					delete process.env.PRIME_TEAM_ID;
-				} else {
-					process.env.PRIME_TEAM_ID = originalPrimeTeamId;
-				}
-			}
-		});
+				vi.stubEnv("PRIME_TEAM_ID", undefined);
+				expect(authStorage.getPrimeInferenceTeamSelection()).toEqual(team);
+				expect(authStorage.get("prime-inference")).toMatchObject({ primeTeam: team });
+			});
 
-		test("prime inference missing Agent team selection falls back to Prime CLI team", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team" }));
-			writeAuthJson({
-				"prime-inference": {
+			test("CLI edits cannot revive stale Agent auth or replace its cached team", async () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+				expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+				writeFileSync(primeConfigPath, JSON.stringify({ api_key: "fresh-cli-key", team_id: "new-cli-team" }));
+				expect(authStorage.hasAuth("prime-inference")).toBe(false);
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+				expect(authStorage.getAuthStatus("prime-inference")).toEqual({
+					configured: false,
+					source: "stale",
+					label: "expired",
+				});
+				expect(authStorage.getPrimeInferenceTeamSelection()).toEqual(team);
+				authStorage.setPrimeInferenceTeamSelection(null);
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+				expect(authStorage.getAuthStatus("prime-inference").source).toBe("stale");
+				expect(createStorage().getPrimeInferenceTeamSelection()).toBeNull();
+				authStorage.setPrimeInferenceApiKey("fresh-agent-key");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("fresh-agent-key");
+				expect(authStorage.getAuthStatus("prime-inference")).toEqual({ configured: true, source: "stored" });
+			});
+
+			test("saving an Agent key does not revive stale runtime or environment credentials", async () => {
+				authStorage = createStorage();
+				vi.stubEnv("PRIME_API_KEY", "env-key");
+				authStorage.setRuntimeApiKey("prime-inference", "runtime-key");
+				expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+				expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+				authStorage.setPrimeInferenceApiKey("agent-key");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("agent-key");
+				authStorage.remove("prime-inference");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+				vi.stubEnv("PRIME_API_KEY", "fresh-env-key");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("fresh-env-key");
+			});
+
+			test("login preserves, clears, or replaces team according to key and explicit selection", () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+				authStorage.setPrimeInferenceApiKey("agent-key");
+				expect(createStorage().getPrimeInferenceTeamSelection()).toEqual(team);
+				authStorage.setPrimeInferenceApiKey("different-key");
+				expect(createStorage().get("prime-inference")).toEqual({
 					type: "api_key",
-					key: "agent-key",
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "cli-team" });
-		});
-
-		test("prime inference provider header changes are picked up without reload", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-1" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-2" }));
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-2" });
-		});
-
-		test("setPrimeInferenceApiKey creates Prime CLI config", async () => {
-			const primeConfigPath = join(tempDir, "prime", "config.json");
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("new-prime-key");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBe("new-prime-key");
-			expect(statSync(primeConfigPath).mode & 0o777).toBe(0o600);
-			expect(authStorage.has("prime-inference")).toBe(false);
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("new-prime-key");
-		});
-
-		test("setPrimeInferenceApiKey clears stale Prime CLI team selection", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(
-				primeConfigPath,
-				JSON.stringify({
-					api_key: "old-prime-key",
-					team_id: "old-team",
-					team_name: "Old Team",
-					team_role: "admin",
-				}),
-			);
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("new-prime-key");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBe("new-prime-key");
-			expect(config.team_id).toBeUndefined();
-			expect(config.team_name).toBeUndefined();
-			expect(config.team_role).toBeUndefined();
-		});
-
-		test("setPrimeInferenceApiKey preserves Prime CLI team selection for the same key", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(
-				primeConfigPath,
-				JSON.stringify({
-					api_key: "prime-cli-key",
-					team_id: "team-1",
-					team_name: "Research",
-					team_role: "admin",
-				}),
-			);
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("prime-cli-key");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBe("prime-cli-key");
-			expect(config.team_id).toBe("team-1");
-			expect(config.team_name).toBe("Research");
-			expect(config.team_role).toBe("admin");
-			expect(authStorage.has("prime-inference")).toBe(false);
-		});
-
-		test("setPrimeInferenceApiKey migrates legacy team selection for the same Prime CLI key", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: { teamId: "team-1", name: "Research", slug: "research", role: "admin" },
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("prime-cli-key");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBe("prime-cli-key");
-			expect(config.team_id).toBe("team-1");
-			expect(config.team_name).toBe("Research");
-			expect(config.team_role).toBe("admin");
-			expect(authStorage.has("prime-inference")).toBe(false);
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
-		});
-
-		test("setPrimeInferenceApiKey migrates legacy personal selection for the same Prime CLI key", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(
-				primeConfigPath,
-				JSON.stringify({
-					api_key: "prime-cli-key",
-					team_id: "team-1",
-					team_name: "Research",
-				}),
-			);
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
+					key: "different-key",
 					primeTeam: null,
+				});
+				authStorage.setPrimeInferenceApiKey("imported-key", team);
+				expect(createStorage().getPrimeInferenceTeamSelection()).toEqual(team);
+				authStorage.setPrimeInferenceApiKey("imported-key", null);
+				expect(createStorage().getPrimeInferenceTeamSelection()).toBeNull();
+			});
+
+			test.each(["existing", "missing", "directory"])(
+				"Agent login, team, and logout leave %s CLI config unchanged",
+				async (state) => {
+					if (state !== "existing") rmSync(primeConfigPath);
+					if (state === "directory") mkdirSync(primeConfigPath);
+					const cliState = () => {
+						if (!existsSync(primeConfigPath)) return undefined;
+						return statSync(primeConfigPath).isDirectory() ? "directory" : readFileSync(primeConfigPath, "utf8");
+					};
+					const cliBefore = cliState();
+					authStorage = createStorage();
+					authStorage.setPrimeInferenceApiKey("agent-key", team);
+					expect(cliState()).toBe(cliBefore);
+					expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
+					const reopened = createStorage();
+					await expect(reopened.getApiKey("prime-inference")).resolves.toBe("agent-key");
+					expect(reopened.getPrimeInferenceTeamSelection()).toEqual(team);
+					authStorage.setPrimeInferenceTeamSelection({ teamId: "new-team", name: "New Team" });
+					expect(createStorage().getPrimeInferenceTeamSelection()?.teamId).toBe("new-team");
+					expect(cliState()).toBe(cliBefore);
+					authStorage.setPrimeInferenceTeamSelection(null);
+					expect(createStorage().getPrimeInferenceTeamSelection()).toBeNull();
+					expect(cliState()).toBe(cliBefore);
+					authStorage.logout("prime-inference");
+					expect(createStorage().has("prime-inference")).toBe(false);
+					await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+					expect(cliState()).toBe(cliBefore);
+					expect(authStorage.drainErrors()).toEqual([]);
 				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("prime-cli-key");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBe("prime-cli-key");
-			expect(config.team_id).toBeUndefined();
-			expect(config.team_name).toBeUndefined();
-			expect(authStorage.has("prime-inference")).toBe(false);
-			expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
-		});
-
-		test("setPrimeInferenceApiKey removes legacy Prime Agent credential after Prime CLI save", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: { teamId: "team-1", name: "Research" },
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceApiKey("new-prime-key");
-
-			const agentAuth = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<string, unknown>;
-			expect(agentAuth["prime-inference"]).toBeUndefined();
-			expect(authStorage.has("prime-inference")).toBe(false);
-		});
-
-		test("setPrimeInferenceApiKey throws when Prime CLI config cannot be written", () => {
-			const primeConfigPath = join(tempDir, "prime-config-dir");
-			mkdirSync(primeConfigPath);
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			expect(() => authStorage.setPrimeInferenceApiKey("new-prime-key")).toThrow();
-			expect(authStorage.drainErrors()).toHaveLength(1);
-		});
-
-		test("setPrimeInferenceApiKey preserves team selection when Prime CLI config is disabled", () => {
-			writeAuthJson({
-				"prime-inference": {
-					type: "api_key",
-					key: "agent-key",
-					primeTeam: { teamId: "team-1", name: "Research" },
-				},
-			});
-
-			authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
-
-			authStorage.setPrimeInferenceApiKey("new-prime-key");
-
-			expect(authStorage.get("prime-inference")).toEqual({
-				type: "api_key",
-				key: "new-prime-key",
-				primeTeam: { teamId: "team-1", name: "Research" },
-			});
-		});
-
-		test("logout clears Prime CLI credentials when enabled", async () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(
-				primeConfigPath,
-				JSON.stringify({
-					api_key: "prime-cli-key",
-					team_id: "team-1",
-					team_name: "Research",
-				}),
 			);
-			writeAuthJson({
-				"prime-inference": {
+
+			test("key and team changes merge the current disk credential, not a stale instance", () => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				authStorage = createStorage();
+				const peer = createStorage();
+				const peerTeam = { teamId: "peer-team", name: "Peer Team" };
+				peer.setPrimeInferenceTeamSelection(peerTeam);
+				authStorage.setPrimeInferenceApiKey("agent-key");
+				expect(createStorage().getPrimeInferenceTeamSelection()).toEqual(peerTeam);
+				peer.setPrimeInferenceApiKey("peer-key", team);
+				authStorage.setPrimeInferenceTeamSelection(peerTeam);
+				expect(createStorage().get("prime-inference")).toEqual({
 					type: "api_key",
-					key: "agent-key",
-					primeTeam: { teamId: "team-1", name: "Research" },
+					key: "peer-key",
+					primeTeam: peerTeam,
+				});
+			});
+
+			test.each(["rotation", "logout"])("stale team picker cannot overwrite credentials after peer %s", (change) => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "old-key", primeTeam: team } });
+				authStorage = createStorage();
+				const peer = createStorage();
+				const newTeam = { teamId: "new-team", name: "New Team" };
+				if (change === "rotation") peer.setPrimeInferenceApiKey("new-key", newTeam);
+				else peer.logout("prime-inference");
+
+				for (const selection of [{ teamId: "stale-team", name: "Stale Team" }, null]) {
+					authStorage.setPrimeInferenceTeamSelection(selection, "old-key");
+					expect(createStorage().get("prime-inference")).toEqual(
+						change === "rotation" ? { type: "api_key", key: "new-key", primeTeam: newTeam } : undefined,
+					);
+				}
+			});
+
+			test.each(["login", "team", "logout"])(
+				"failed %s leaves disk, memory, stale state, and CLI unchanged",
+				async (operation) => {
+					const credential = { type: "api_key", key: "agent-key", primeTeam: team };
+					writeAuthJson({ "prime-inference": credential });
+					authStorage = createStorage();
+					const beforeAuth = readFileSync(authJsonPath, "utf8");
+					const beforeCli = readFileSync(primeConfigPath, "utf8");
+					expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+					renameFault.error = new Error("disk full");
+					try {
+						expect(() => {
+							if (operation === "login") authStorage.setPrimeInferenceApiKey("new-key");
+							else if (operation === "team") authStorage.setPrimeInferenceTeamSelection(null);
+							else authStorage.logout("prime-inference");
+						}).toThrow("disk full");
+					} finally {
+						renameFault.error = undefined;
+					}
+					expect(authStorage.get("prime-inference")).toEqual(credential);
+					expect(readFileSync(authJsonPath, "utf8")).toBe(beforeAuth);
+					expect(readFileSync(primeConfigPath, "utf8")).toBe(beforeCli);
+					await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+					expect(authStorage.getAuthStatus("prime-inference").source).toBe("stale");
 				},
+			);
+
+			test.each(["[]", "null", '"fake-secret"', "1", "true", "{"])(
+				"invalid Agent auth rejects startup and verified login without changing disk: %s",
+				(content) => {
+					writeFileSync(authJsonPath, content);
+					authStorage = createStorage();
+					expect(authStorage.drainErrors()).toHaveLength(1);
+					expect(authStorage.list()).toEqual([]);
+					expect(() => authStorage.setPrimeInferenceApiKey("replacement")).toThrow();
+					expect(readFileSync(authJsonPath, "utf8")).toBe(content);
+					expect(authStorage.list()).toEqual([]);
+				},
+			);
+
+			test("late invalid auth preserves stale identity through failed changes and permits repaired-file retry", () => {
+				const credential = { type: "api_key", key: "agent-key", primeTeam: team };
+				writeAuthJson({ "prime-inference": credential });
+				authStorage = createStorage();
+				expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+				writeFileSync(authJsonPath, "[]");
+				for (const change of [
+					() => authStorage.setPrimeInferenceApiKey("replacement"),
+					() => authStorage.setPrimeInferenceTeamSelection(null, "agent-key"),
+					() => authStorage.logout("prime-inference"),
+				]) {
+					expect(change).toThrow();
+					expect(readFileSync(authJsonPath, "utf8")).toBe("[]");
+					expect(authStorage.get("prime-inference")).toEqual(credential);
+					expect(authStorage.getAuthStatus("prime-inference").source).toBe("stale");
+				}
+				authStorage.reload();
+				expect(authStorage.get("prime-inference")).toEqual(credential);
+				expect(authStorage.getAuthStatus("prime-inference").source).toBe("stale");
+				writeAuthJson({});
+				authStorage.setPrimeInferenceApiKey("repaired-key");
+				expect(authStorage.getAuthStatus("prime-inference")).toEqual({ configured: true, source: "stored" });
+				expect(createStorage().get("prime-inference")).toEqual({
+					type: "api_key",
+					key: "repaired-key",
+					primeTeam: null,
+				});
 			});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.logout("prime-inference");
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.api_key).toBeUndefined();
-			expect(config.team_id).toBeUndefined();
-			expect(config.team_name).toBeUndefined();
-			expect(authStorage.has("prime-inference")).toBe(false);
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
-		});
-
-		test("setPrimeInferenceTeamSelection writes Prime CLI config", () => {
-			const primeConfigPath = join(tempDir, "prime-config.json");
-			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-			writeAuthJson({});
-
-			authStorage = AuthStorage.create(authJsonPath, {
-				primeCliConfigPath: primeConfigPath,
-				usePrimeCliConfig: true,
-			});
-
-			authStorage.setPrimeInferenceTeamSelection({ teamId: "team-1", name: "Research", role: "admin" });
-
-			const config = JSON.parse(readFileSync(primeConfigPath, "utf-8")) as Record<string, unknown>;
-			expect(config.team_id).toBe("team-1");
-			expect(config.team_name).toBe("Research");
-			expect(config.team_role).toBe("admin");
-			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
 		});
 
 		test("apiKey command can use shell features like pipes", async () => {
@@ -833,26 +603,6 @@ describe("AuthStorage", () => {
 
 				const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
 				expect(count).toBe(1);
-			});
-
-			test("clearConfigValueCache allows command to run again", async () => {
-				const counterFile = join(tempDir, "counter");
-				writeFileSync(counterFile, "0");
-
-				const counterPath = toShPath(counterFile);
-				const command = `!sh -c 'count=$(cat "${counterPath}"); echo $((count + 1)) > "${counterPath}"; echo "key-value"'`;
-				writeAuthJson({
-					anthropic: { type: "api_key", key: command },
-				});
-
-				authStorage = AuthStorage.create(authJsonPath);
-				await authStorage.getApiKey("anthropic");
-
-				clearConfigValueCache();
-				await authStorage.getApiKey("anthropic");
-
-				const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
-				expect(count).toBe(2);
 			});
 
 			test("different commands are cached separately", async () => {
@@ -973,6 +723,125 @@ describe("AuthStorage", () => {
 	});
 
 	describe("persistence semantics", () => {
+		test("completes a short initial write before loading and saving credentials", () => {
+			initialWriteFault.count = 1;
+			try {
+				authStorage = AuthStorage.create(authJsonPath);
+			} finally {
+				initialWriteFault.count = -1;
+			}
+
+			expect(authStorage.drainErrors()).toEqual([]);
+			expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({});
+			authStorage.set("openai", { type: "api_key", key: "new-key" });
+			expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toMatchObject({
+				openai: { type: "api_key", key: "new-key" },
+			});
+		});
+
+		test("fails initial writes that make no progress before exposing storage", () => {
+			const backend = new FileAuthStorageBackend(authJsonPath);
+			const consume = vi.fn(() => ({ result: undefined }));
+			initialWriteFault.count = 0;
+			try {
+				expect(() => backend.withLock(consume)).toThrow(/Short write/);
+				expect(consume).not.toHaveBeenCalled();
+			} finally {
+				initialWriteFault.count = -1;
+			}
+		});
+
+		test("first-run initialization survives a restrictive umask", () => {
+			const previousUmask = process.umask(0o700);
+			try {
+				authStorage = AuthStorage.create(authJsonPath);
+				authStorage.set("openai", { type: "api_key", key: "masked-key" });
+			} finally {
+				process.umask(previousUmask);
+			}
+
+			expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
+			const onDisk = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<string, { key: string }>;
+			expect(onDisk.openai.key).toBe("masked-key");
+		});
+
+		test.each([
+			[
+				"an existing target",
+				(): { alias: string; target: string } => {
+					const target = join(tempDir, "real-auth.json");
+					writeFileSync(target, "{}");
+					rmSync(authJsonPath, { force: true });
+					symlinkSync(target, authJsonPath);
+					return { alias: authJsonPath, target };
+				},
+			],
+			[
+				"a dangling absolute target",
+				(): { alias: string; target: string } => {
+					const target = join(tempDir, "vault", "auth.json");
+					mkdirSync(join(tempDir, "vault"), { recursive: true });
+					symlinkSync(target, authJsonPath);
+					return { alias: authJsonPath, target };
+				},
+			],
+			[
+				"a dangling relative target under a symlinked directory",
+				(): { alias: string; target: string } => {
+					const realDir = join(tempDir, "real-dir");
+					mkdirSync(realDir, { recursive: true });
+					const aliasDir = join(tempDir, "alias-dir");
+					symlinkSync(realDir, aliasDir);
+					symlinkSync("./credentials.json", join(aliasDir, "auth.json"));
+					return { alias: join(aliasDir, "auth.json"), target: join(realDir, "credentials.json") };
+				},
+			],
+		])("writes through a symlinked auth.json (%s) with the alias intact", (_name, setup) => {
+			const { alias, target } = setup();
+			authStorage = AuthStorage.create(alias);
+
+			authStorage.set("openai", { type: "api_key", key: "through-alias" });
+
+			expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+			const real = JSON.parse(readFileSync(target, "utf-8")) as Record<string, { key: string }>;
+			expect(real.openai.key).toBe("through-alias");
+		});
+
+		test("initialization never replaces credentials another process already saved", () => {
+			authStorage = AuthStorage.create(authJsonPath);
+			// A rival process persists credentials between the absence check and the write.
+			writeAuthJson({ anthropic: { type: "api_key", key: "already-saved" } });
+			absenceIllusion.paths.add(authJsonPath);
+
+			try {
+				const backend = (authStorage as unknown as { storage: { ensureFileExists(): void } }).storage;
+				backend.ensureFileExists();
+			} finally {
+				absenceIllusion.paths.delete(authJsonPath);
+			}
+
+			const onDisk = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<string, { key: string }>;
+			expect(onDisk.anthropic.key).toBe("already-saved");
+		});
+
+		test("a write failing at the replace boundary leaves the previous credentials intact", () => {
+			writeAuthJson({ anthropic: { type: "api_key", key: "old-key" } });
+			authStorage = AuthStorage.create(authJsonPath);
+			renameFault.error = new Error("disk full");
+
+			try {
+				authStorage.set("anthropic", { type: "api_key", key: "new-key" });
+			} finally {
+				renameFault.error = undefined;
+			}
+
+			expect(authStorage.drainErrors().map((error) => String(error))).toEqual([
+				expect.stringContaining("disk full"),
+			]);
+			const onDisk = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<string, { key: string }>;
+			expect(onDisk.anthropic.key).toBe("old-key");
+		});
+
 		test("set preserves unrelated external edits", () => {
 			writeAuthJson({
 				anthropic: { type: "api_key", key: "old-anthropic" },

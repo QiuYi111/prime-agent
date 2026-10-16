@@ -1,12 +1,12 @@
-import type { Model } from "@earendil-works/pi-ai";
-import { describe, expect, test } from "vitest";
+import { getModels, getSupportedThinkingLevels, type KnownProvider, type Model } from "@earendil-works/pi-ai";
+import { describe, expect, test, vi } from "vitest";
 import {
 	defaultModelPerProvider,
 	findInitialModel,
-	parseModelPattern,
 	resolveCliModel,
 	resolveModelScopeFromModels,
 } from "../src/core/model-resolver.js";
+import { getPrivatePrimeInferenceModels } from "../src/core/prime-inference-models.js";
 
 const mockModels: Model<"anthropic-messages">[] = [
 	{
@@ -90,163 +90,46 @@ describe("resolveModelScopeFromModels", () => {
 		expect(result[1]?.model.provider).toBe("openai");
 		expect(result[1]?.model.id).toBe("gpt-4o");
 	});
-});
 
-describe("parseModelPattern", () => {
-	describe("simple patterns without colons", () => {
-		test("exact match returns model with undefined thinking level", () => {
-			const result = parseModelPattern("claude-sonnet-4-5", allModels);
-			expect(result.model?.id).toBe("claude-sonnet-4-5");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
+	test("resolves a thinking level after a colon-bearing model id", () => {
+		const result = resolveModelScopeFromModels(["openrouter/qwen/qwen3-coder:exacto:high"], allModels);
 
-		test("partial match returns best model with undefined thinking level", () => {
-			const result = parseModelPattern("sonnet", allModels);
-			expect(result.model?.id).toBe("claude-sonnet-4-5");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("preserves provider-qualified selections when model names overlap", () => {
-			const primeInferenceModel: Model<"anthropic-messages"> = {
-				...mockModels[0],
-				id: "z-ai/glm-5.2",
-				name: "GLM 5.2",
-				provider: "prime-inference",
-				baseUrl: "https://api.pinference.ai/api/v1",
-			};
-			const huggingFaceModel: Model<"anthropic-messages"> = {
-				...primeInferenceModel,
-				id: "zai-org/GLM-5.2",
-				provider: "huggingface",
-				baseUrl: "https://router.huggingface.co/v1",
-			};
-
-			const result = parseModelPattern("huggingface/zai-org/GLM-5.2", [primeInferenceModel, huggingFaceModel]);
-
-			expect(result.model).toBe(huggingFaceModel);
-		});
-
-		test("no match returns undefined model and thinking level", () => {
-			const result = parseModelPattern("nonexistent", allModels);
-			expect(result.model).toBeUndefined();
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
+		expect(result).toEqual([{ model: mockOpenRouterModels[0], thinkingLevel: "high" }]);
 	});
 
-	describe("patterns with valid thinking levels", () => {
-		test("sonnet:high returns sonnet with high thinking level", () => {
-			const result = parseModelPattern("sonnet:high", allModels);
-			expect(result.model?.id).toBe("claude-sonnet-4-5");
-			expect(result.thinkingLevel).toBe("high");
-			expect(result.warning).toBeUndefined();
-		});
+	test("keeps the model, warns, and drops an invalid thinking suffix", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const result = resolveModelScopeFromModels(["sonnet:random"], allModels);
 
-		test("gpt-4o:medium returns gpt-4o with medium thinking level", () => {
-			const result = parseModelPattern("gpt-4o:medium", allModels);
-			expect(result.model?.id).toBe("gpt-4o");
-			expect(result.thinkingLevel).toBe("medium");
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("all valid thinking levels work", () => {
-			for (const level of ["off", "minimal", "low", "medium", "high", "xhigh"]) {
-				const result = parseModelPattern(`sonnet:${level}`, allModels);
-				expect(result.model?.id).toBe("claude-sonnet-4-5");
-				expect(result.thinkingLevel).toBe(level);
-				expect(result.warning).toBeUndefined();
-			}
-		});
+			expect(result).toEqual([{ model: mockModels[0], thinkingLevel: undefined }]);
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('Invalid thinking level "random"'));
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
-	describe("patterns with invalid thinking levels", () => {
-		test("sonnet:random returns sonnet with undefined thinking level and warning", () => {
-			const result = parseModelPattern("sonnet:random", allModels);
-			expect(result.model?.id).toBe("claude-sonnet-4-5");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toContain("Invalid thinking level");
-			expect(result.warning).toContain("random");
-		});
+	test("preserves provider-qualified selections when model names overlap", () => {
+		const primeInferenceModel: Model<"anthropic-messages"> = {
+			...mockModels[0]!,
+			id: "z-ai/glm-5.2",
+			name: "GLM 5.2",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+		};
+		const huggingFaceModel: Model<"anthropic-messages"> = {
+			...primeInferenceModel,
+			id: "zai-org/GLM-5.2",
+			provider: "huggingface",
+			baseUrl: "https://router.huggingface.co/v1",
+		};
 
-		test("gpt-4o:invalid returns gpt-4o with undefined thinking level and warning", () => {
-			const result = parseModelPattern("gpt-4o:invalid", allModels);
-			expect(result.model?.id).toBe("gpt-4o");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toContain("Invalid thinking level");
-		});
-	});
+		const result = resolveModelScopeFromModels(
+			["huggingface/zai-org/GLM-5.2"],
+			[primeInferenceModel, huggingFaceModel],
+		);
 
-	describe("OpenRouter models with colons in IDs", () => {
-		test("qwen3-coder:exacto matches the model with undefined thinking level", () => {
-			const result = parseModelPattern("qwen/qwen3-coder:exacto", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("openrouter/qwen/qwen3-coder:exacto matches with provider prefix", () => {
-			const result = parseModelPattern("openrouter/qwen/qwen3-coder:exacto", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.model?.provider).toBe("openrouter");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("qwen3-coder:exacto:high matches model with high thinking level", () => {
-			const result = parseModelPattern("qwen/qwen3-coder:exacto:high", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.thinkingLevel).toBe("high");
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("openrouter/qwen/qwen3-coder:exacto:high matches with provider and thinking level", () => {
-			const result = parseModelPattern("openrouter/qwen/qwen3-coder:exacto:high", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.model?.provider).toBe("openrouter");
-			expect(result.thinkingLevel).toBe("high");
-			expect(result.warning).toBeUndefined();
-		});
-
-		test("gpt-4o:extended matches the extended model with undefined thinking level", () => {
-			const result = parseModelPattern("openai/gpt-4o:extended", allModels);
-			expect(result.model?.id).toBe("openai/gpt-4o:extended");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toBeUndefined();
-		});
-	});
-
-	describe("invalid thinking levels with OpenRouter models", () => {
-		test("qwen3-coder:exacto:random returns model with undefined thinking level and warning", () => {
-			const result = parseModelPattern("qwen/qwen3-coder:exacto:random", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toContain("Invalid thinking level");
-			expect(result.warning).toContain("random");
-		});
-
-		test("qwen3-coder:exacto:high:random returns model with undefined thinking level and warning", () => {
-			const result = parseModelPattern("qwen/qwen3-coder:exacto:high:random", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
-			expect(result.thinkingLevel).toBeUndefined();
-			expect(result.warning).toContain("Invalid thinking level");
-			expect(result.warning).toContain("random");
-		});
-	});
-
-	describe("edge cases", () => {
-		test("empty pattern matches via partial matching", () => {
-			const result = parseModelPattern("", allModels);
-			expect(result.model).not.toBeNull();
-			expect(result.thinkingLevel).toBeUndefined();
-		});
-
-		test("pattern ending with colon treats empty suffix as invalid", () => {
-			const result = parseModelPattern("sonnet:", allModels);
-			expect(result.model?.id).toBe("claude-sonnet-4-5");
-			expect(result.warning).toContain("Invalid thinking level");
-		});
+		expect(result).toEqual([{ model: huggingFaceModel, thinkingLevel: undefined }]);
 	});
 });
 
@@ -412,17 +295,85 @@ describe("resolveCliModel", () => {
 		expect(result.model?.provider).toBe("openrouter");
 		expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
 	});
+
+	test("derives unknown private Prime Inference ids from a private-route template", () => {
+		// The registry a daemon worker builds for a fresh session: bundled public
+		// catalog plus bundled private models, without the team-authorized private
+		// catalog that only loads after refreshAvailableModels().
+		const registry = {
+			getAll: () => [...getModels("prime-inference"), ...getPrivatePrimeInferenceModels()],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliProvider: "prime-inference",
+			cliModel: "internal/glm-5.3-fast",
+			modelRegistry: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.id).toBe("internal/glm-5.3-fast");
+		expect(result.model?.provider).toBe("prime-inference");
+		expect(result.model?.baseUrl).toBe("https://api.pinference.ai/api/v1");
+		const model = result.model as Model<"openai-completions">;
+		// The public provider default carries the zai thinking format; a private
+		// route must not inherit it (enable_thinking is a provider 400 there).
+		expect(model.compat?.thinkingFormat).toBeUndefined();
+		// The zai thinkingLevelMap would coerce thinking "off" to "low".
+		expect(getSupportedThinkingLevels(model).includes("off")).toBe(true);
+	});
+
+	test("still derives unknown public Prime Inference ids from the provider default", () => {
+		const registry = {
+			getAll: () => [...getModels("prime-inference"), ...getPrivatePrimeInferenceModels()],
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliProvider: "prime-inference",
+			cliModel: "z-ai/glm-9",
+			modelRegistry: registry,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.id).toBe("z-ai/glm-9");
+		expect((result.model as Model<"openai-completions">).compat?.thinkingFormat).toBe("zai");
+	});
+
+	test("keeps an unknown private Prime Inference id unresolved without a private template", () => {
+		const registry = {
+			getAll: () => getModels("prime-inference"),
+		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+
+		const result = resolveCliModel({
+			cliProvider: "prime-inference",
+			cliModel: "internal/glm-5.3-fast",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain("not found");
+	});
 });
 
 describe("default model selection", () => {
 	test("openai defaults track current models", () => {
 		expect(defaultModelPerProvider.openai).toBe("gpt-5.4");
 		expect(defaultModelPerProvider["openai-codex"]).toBe("gpt-5.5");
-		expect(defaultModelPerProvider["prime-inference"]).toBe("z-ai/glm-5.2");
+		expect(defaultModelPerProvider["prime-inference"]).toBe("z-ai/glm-5.3");
+	});
+
+	test("every per-provider default exists in the model catalog", () => {
+		for (const [provider, modelId] of Object.entries(defaultModelPerProvider)) {
+			const models = getModels(provider as KnownProvider);
+			if (models.length === 0) continue;
+			expect(
+				models.map((model) => model.id),
+				`default for ${provider}`,
+			).toContain(modelId);
+		}
 	});
 
 	test("zai, minimax, and cerebras defaults track current models", () => {
-		expect(defaultModelPerProvider.zai).toBe("glm-5.1");
+		expect(defaultModelPerProvider.zai).toBe("glm-5.3");
 		expect(defaultModelPerProvider.minimax).toBe("MiniMax-M2.7");
 		expect(defaultModelPerProvider["minimax-cn"]).toBe("MiniMax-M2.7");
 		expect(defaultModelPerProvider.cerebras).toBe("gpt-oss-120b");
@@ -465,15 +416,15 @@ describe("default model selection", () => {
 		expect(result.thinkingLevel).toBe("medium");
 	});
 
-	test("findInitialModel prefers GLM 5.2 when Prime Inference is configured", async () => {
+	test("findInitialModel prefers GLM 5.3 when Prime Inference is configured", async () => {
 		const anthropicModel: Model<"anthropic-messages"> = {
 			...mockModels[0],
 			id: "claude-opus-4-7",
 			name: "Claude Opus 4.7",
 		};
 		const primeModel: Model<"anthropic-messages"> = {
-			id: "z-ai/glm-5.2",
-			name: "GLM 5.2",
+			id: "z-ai/glm-5.3",
+			name: "GLM 5.3",
 			api: "anthropic-messages",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -484,7 +435,11 @@ describe("default model selection", () => {
 			maxTokens: 101376,
 		};
 		const registry = {
-			refreshAvailableModels: async () => [anthropicModel, primeModel],
+			refreshAvailableModels: async () => [
+				anthropicModel,
+				{ ...primeModel, id: "z-ai/glm-5.2", name: "GLM 5.2" },
+				primeModel,
+			],
 		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
 
 		const result = await findInitialModel({

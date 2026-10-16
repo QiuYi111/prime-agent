@@ -8,7 +8,7 @@ import {
 	streamOpenAICodexResponses,
 	streamSimpleOpenAICodexResponses,
 } from "../src/providers/openai-codex-responses.js";
-import type { Context, Model } from "../src/types.js";
+import type { AssistantMessage, Context, Model } from "../src/types.js";
 
 const originalFetch = global.fetch;
 const originalWebSocket = globalThis.WebSocket;
@@ -562,6 +562,8 @@ describe("openai-codex streaming", () => {
 	});
 
 	it.each([
+		// "default" must stay on the wire: absence means "auto" (the project tier).
+		["gpt-5.1-codex", "default", 1],
 		["gpt-5.1-codex", "flex", 0.5],
 		["gpt-5.1-codex", "priority", 2],
 		["gpt-5.4", "priority", 2],
@@ -1004,5 +1006,472 @@ describe("openai-codex streaming", () => {
 			lastDeltaInputItems: 1,
 			lastPreviousResponseId: "resp_1",
 		});
+	});
+
+	it("sends full context without a stale previous_response_id after a reconnect and re-anchors", async () => {
+		const token = mockToken();
+		let firstSocket: ScriptedWebSocketHandle | undefined;
+		const sentBodies = installScriptedCodexWebSocket([
+			(socket) => {
+				firstSocket = socket;
+				socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" }));
+			},
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_2", messageId: "msg_2", text: "Done" })),
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_3", messageId: "msg_3", text: "Again" })),
+		]);
+
+		const model = codexTestModel();
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "session-reconnect",
+			transport: "websocket-cached",
+		}).result();
+
+		// The server dropped the connection during the idle gap between turns.
+		firstSocket?.drop();
+
+		const secondContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
+		};
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "session-reconnect",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(second.stopReason).toBe("stop");
+
+		const thirdContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...secondContext.messages, second, { role: "user", content: "And again", timestamp: 3 }],
+		};
+		await streamOpenAICodexResponses(model, thirdContext, {
+			apiKey: token,
+			sessionId: "session-reconnect",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(sentBodies).toHaveLength(3);
+		const reconnectedBody = sentBodies[1] as { previous_response_id?: string; input: unknown[] };
+		const resumedBody = sentBodies[2] as { previous_response_id?: string; input: unknown[] };
+		// The reconnected connection starts from the full context, never the dead
+		// connection's previous_response_id.
+		expect(reconnectedBody.previous_response_id).toBeUndefined();
+		expect(reconnectedBody.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Say hello" }] },
+			{
+				type: "message",
+				role: "assistant",
+				content: [{ type: "output_text", text: "Hello", annotations: [] }],
+				status: "completed",
+				id: "msg_1",
+			},
+			{ role: "user", content: [{ type: "input_text", text: "Now finish" }] },
+		]);
+		// The chain re-anchors on the reconnected connection's response.
+		expect(resumedBody.previous_response_id).toBe("resp_2");
+		expect(resumedBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "And again" }] }]);
+		expect(global.fetch).not.toHaveBeenCalled();
+		expect(getOpenAICodexWebSocketDebugStats("session-reconnect")).toMatchObject({
+			requests: 3,
+			connectionsCreated: 2,
+			connectionsReused: 1,
+			fullContextRequests: 2,
+			deltaRequests: 1,
+			lastPreviousResponseId: "resp_2",
+		});
+	});
+
+	it("recovers a stale previous_response_id with one full-context chain-reset retry", async () => {
+		const token = mockToken();
+		const sentBodies = installScriptedCodexWebSocket([
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" })),
+			(socket) =>
+				socket.emit(
+					codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_1' not found"),
+				),
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_2", messageId: "msg_2", text: "Done" })),
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_3", messageId: "msg_3", text: "Again" })),
+		]);
+
+		const model = codexTestModel();
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset",
+			transport: "websocket-cached",
+		}).result();
+
+		const secondContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
+		};
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset",
+			transport: "websocket-cached",
+		}).result();
+
+		// The stale continuation was recovered within the same turn.
+		expect(second.stopReason).toBe("stop");
+		expect(second.content[0]).toMatchObject({ type: "text", text: "Done" });
+
+		// A later turn proves the chain resumed from the retried response.
+		const thirdContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...secondContext.messages, second, { role: "user", content: "And again", timestamp: 3 }],
+		};
+		await streamOpenAICodexResponses(model, thirdContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(sentBodies).toHaveLength(4);
+		const deltaBody = sentBodies[1] as { previous_response_id?: string; input: unknown[] };
+		const retryBody = sentBodies[2] as { previous_response_id?: string; input: unknown[] };
+		const resumedBody = sentBodies[3] as { previous_response_id?: string; input: unknown[] };
+		expect(deltaBody.previous_response_id).toBe("resp_1");
+		expect(deltaBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
+		// The chain reset resends the full request body without previous_response_id.
+		expect(retryBody.previous_response_id).toBeUndefined();
+		expect(retryBody.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Say hello" }] },
+			{
+				type: "message",
+				role: "assistant",
+				content: [{ type: "output_text", text: "Hello", annotations: [] }],
+				status: "completed",
+				id: "msg_1",
+			},
+			{ role: "user", content: [{ type: "input_text", text: "Now finish" }] },
+		]);
+		expect(resumedBody.previous_response_id).toBe("resp_2");
+		expect(resumedBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "And again" }] }]);
+		expect(global.fetch).not.toHaveBeenCalled();
+		expect(getOpenAICodexWebSocketDebugStats("session-chain-reset")).toMatchObject({
+			requests: 4,
+			connectionsCreated: 2,
+			connectionsReused: 2,
+			cachedContextRequests: 4,
+			fullContextRequests: 2,
+			deltaRequests: 2,
+			websocketFailures: 0,
+			sseFallbacks: 0,
+		});
+	});
+
+	it("surfaces the error without further retries when the chain-reset retry fails again", async () => {
+		const token = mockToken();
+		const sentBodies = installScriptedCodexWebSocket([
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" })),
+			(socket) =>
+				socket.emit(
+					codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_1' not found"),
+				),
+			(socket) =>
+				socket.emit(
+					codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_9' not found"),
+				),
+		]);
+
+		const model = codexTestModel();
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset-fail",
+			transport: "websocket-cached",
+		}).result();
+
+		const secondContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
+		};
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset-fail",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(second.stopReason).toBe("error");
+		expect(second.errorMessage).toBe("Codex error: Previous response with id 'resp_9' not found");
+		// Exactly one chain-reset retry, then the error surfaces unchanged.
+		expect(sentBodies).toHaveLength(3);
+		const retryBody = sentBodies[2] as { previous_response_id?: string };
+		expect(retryBody.previous_response_id).toBeUndefined();
+		expect(global.fetch).not.toHaveBeenCalled();
+		expect(failureDetails(second)).toMatchObject({ providerErrorType: "previous_response_not_found" });
+	});
+
+	it("does not chain-reset retry other codex api errors", async () => {
+		const token = mockToken();
+		const sentBodies = installScriptedCodexWebSocket([
+			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" })),
+			(socket) => socket.emit(codexErrorEvents("invalid_request", "Invalid request")),
+		]);
+
+		const model = codexTestModel();
+		const firstContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset-other",
+			transport: "websocket-cached",
+		}).result();
+
+		const secondContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
+		};
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "session-chain-reset-other",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(second.stopReason).toBe("error");
+		expect(second.errorMessage).toBe("Codex error: Invalid request");
+		expect(sentBodies).toHaveLength(2);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	function codexTestModel(): Model<"openai-codex-responses"> {
+		return {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+	}
+
+	/** Stub prompt-cache URLs plus a custom /codex/responses handler; returns the request counter. */
+	function stubCodexFetch(respond: () => Response): { responsesRequests: number } {
+		process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
+		const counter = { responsesRequests: 0 };
+		global.fetch = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
+				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
+			}
+			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
+			}
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				counter.responsesRequests++;
+				return respond();
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+		return counter;
+	}
+
+	async function runCodexErrorTurn(): Promise<AssistantMessage> {
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+		return streamOpenAICodexResponses(codexTestModel(), context, { apiKey: mockToken(), transport: "sse" }).result();
+	}
+
+	function failureDetails(result: AssistantMessage): { kind?: string; retryAfterMs?: number } | undefined {
+		const last = result.diagnostics?.at(-1);
+		return last?.type === "provider_stream_failure"
+			? (last as { details?: { kind?: string; retryAfterMs?: number } }).details
+			: undefined;
+	}
+
+	/** Handle the send scripts use to drive a mocked websocket connection. */
+	interface ScriptedWebSocketHandle {
+		emit: (events: unknown[]) => void;
+		/** Simulate the server dropping the connection between turns. */
+		drop: () => void;
+	}
+
+	/**
+	 * Install a scripted WebSocket mock: every websocket send consumes one
+	 * script entry (across socket instances, so reconnects stay scripted) and
+	 * fetch is stubbed so an unexpected SSE fallback fails fast.
+	 */
+	function installScriptedCodexWebSocket(
+		scripts: Array<(socket: ScriptedWebSocketHandle) => void>,
+	): Record<string, unknown>[] {
+		const sentBodies: Record<string, unknown>[] = [];
+
+		class MockWebSocket {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, _protocols?: string | string[] | { headers?: Record<string, string> }) {
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				let listeners = this.listeners.get(type);
+				if (!listeners) {
+					listeners = new Set();
+					this.listeners.set(type, listeners);
+				}
+				listeners.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(data: string): void {
+				sentBodies.push(JSON.parse(data) as Record<string, unknown>);
+				const script = scripts.shift();
+				if (!script) throw new Error("unexpected websocket request");
+				queueMicrotask(() =>
+					script({
+						emit: (events: unknown[]) => this.emit(events),
+						drop: () => {
+							this.readyState = 3;
+						},
+					}),
+				);
+			}
+
+			close(): void {
+				this.readyState = 3;
+			}
+
+			emit(events: unknown[]): void {
+				for (const event of events) {
+					this.dispatch("message", { data: JSON.stringify(event) });
+				}
+			}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) {
+					listener(event);
+				}
+			}
+		}
+
+		global.fetch = vi.fn(async () => new Response("unexpected fetch", { status: 500 })) as typeof fetch;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		return sentBodies;
+	}
+
+	function codexResponseEvents({
+		responseId,
+		messageId,
+		text,
+	}: {
+		responseId: string;
+		messageId: string;
+		text: string;
+	}): unknown[] {
+		return [
+			{ type: "response.created", response: { id: responseId } },
+			{
+				type: "response.output_item.added",
+				item: { type: "message", id: messageId, role: "assistant", status: "in_progress", content: [] },
+			},
+			{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+			{ type: "response.output_text.delta", delta: text },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					id: messageId,
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text }],
+				},
+			},
+			{
+				type: "response.completed",
+				response: {
+					id: responseId,
+					status: "completed",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 3,
+						total_tokens: 8,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			},
+		];
+	}
+
+	function codexErrorEvents(code: string, message: string): unknown[] {
+		return [{ type: "error", code, message }];
+	}
+
+	it("throws a structured failure after a single attempt on HTTP 500", async () => {
+		const counter = stubCodexFetch(
+			() => new Response(JSON.stringify({ error: { type: "server_error", message: "boom" } }), { status: 500 }),
+		);
+
+		const result = await runCodexErrorTurn();
+
+		expect(counter.responsesRequests).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("boom");
+		expect(failureDetails(result)).toMatchObject({ kind: "server_error", status: 500 });
+	});
+
+	it("maps nested streaming usage-limit error payloads to a friendly rate-limit failure", async () => {
+		const resetsAt = Math.round(Date.now() / 1000) + 2 * 3600;
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			status_code: 429,
+			error: { type: "usage_limit_reached", message: "Usage limit reached", plan_type: "Plus", resets_at: resetsAt },
+		})}\n\n`;
+		stubCodexFetch(() => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }));
+
+		const result = await runCodexErrorTurn();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(
+			"You have hit your ChatGPT usage limit (plus plan). Try again in ~120 min.",
+		);
+		const details = failureDetails(result);
+		expect(details?.kind).toBe("rate_limit");
+		expect(details?.retryAfterMs).toBeGreaterThan(0);
+		// resets_at has second granularity, so allow the rounding slack.
+		expect(details?.retryAfterMs).toBeLessThanOrEqual(2 * 3600 * 1000 + 1000);
+	});
+
+	it("waits for the longer of Retry-After header and usage-limit reset", async () => {
+		const resetsAt = Math.round(Date.now() / 1000) + 10;
+		stubCodexFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						error: { type: "usage_limit_reached", message: "Usage limit reached", resets_at: resetsAt },
+					}),
+					{ status: 429, headers: { "retry-after": "60" } },
+				),
+		);
+
+		const result = await runCodexErrorTurn();
+
+		expect(result.stopReason).toBe("error");
+		expect(failureDetails(result)?.retryAfterMs).toBe(60000);
 	});
 });

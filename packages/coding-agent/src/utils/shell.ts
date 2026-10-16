@@ -1,12 +1,20 @@
 import { existsSync } from "node:fs";
-import { delimiter } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { delimiter, win32 } from "node:path";
 import { getBinDir } from "../config.js";
 import { recordOrphanProcessState } from "../core/orphan-process-journal.js";
+import { spawnHidden, spawnSyncHidden } from "./child-process.js";
 
 export interface ShellConfig {
 	shell: string;
 	args: string[];
+}
+
+/** System32\bash.exe is the WSL launcher (runs Linux-side), so %SystemRoot% matches are only a last resort. */
+export function orderWindowsBashCandidates(matches: readonly string[], systemRoot: string | undefined): string[] {
+	if (!systemRoot) return [...matches];
+	const prefix = win32.join(systemRoot, "\\").toLowerCase();
+	const underSystemRoot = (match: string) => win32.normalize(match).toLowerCase().startsWith(prefix);
+	return [...matches.filter((match) => !underSystemRoot(match)), ...matches.filter(underSystemRoot)];
 }
 
 /**
@@ -16,11 +24,13 @@ function findBashOnPath(): string | null {
 	if (process.platform === "win32") {
 		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
 		try {
-			const result = spawnSync("where", ["bash.exe"], { encoding: "utf-8", timeout: 5000 });
+			const result = spawnSyncHidden("where", ["bash.exe"], { encoding: "utf-8", timeout: 5000 });
 			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
-					return firstMatch;
+				const matches = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+				for (const match of orderWindowsBashCandidates(matches, process.env.SystemRoot)) {
+					if (existsSync(match)) {
+						return match;
+					}
 				}
 			}
 		} catch {
@@ -31,7 +41,7 @@ function findBashOnPath(): string | null {
 
 	// Unix: Use 'which' and trust its output (handles Termux and special filesystems)
 	try {
-		const result = spawnSync("which", ["bash"], { encoding: "utf-8", timeout: 5000 });
+		const result = spawnSyncHidden("which", ["bash"], { encoding: "utf-8", timeout: 5000 });
 		if (result.status === 0 && result.stdout) {
 			const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
 			if (firstMatch) {
@@ -106,6 +116,34 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	return { shell: "sh", args: ["-c"] };
 }
 
+// Hardcoded literals: ProgramFiles env vars are ambient attacker-influenceable
+// input, the same trust-laundering class as PATH.
+const WINDOWS_GIT_BASH_PATHS = ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files (x86)\\Git\\bin\\bash.exe"];
+
+/**
+ * Absolute default shell for the kernel's bash(): explicit shellPath wins; POSIX
+ * uses /bin/bash else /bin/sh (absolute, never PATH — the kernel inherits a
+ * user-influenced PATH); win32 uses only the canonical Git Bash install paths,
+ * never PATH (a repo-controlled PATH/where.exe must not pick the kernel shell).
+ * undefined = no shell found: kernel startup must not fail, bash() raises its
+ * teaching error.
+ */
+export function resolveKernelBashShell(customShellPath?: string): string | undefined {
+	const explicit = customShellPath?.trim();
+	if (explicit) {
+		return explicit;
+	}
+	if (process.platform !== "win32") {
+		return existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+	}
+	for (const path of WINDOWS_GIT_BASH_PATHS) {
+		if (existsSync(path)) {
+			return path;
+		}
+	}
+	return undefined;
+}
+
 export function getShellEnv(): NodeJS.ProcessEnv {
 	const binDir = getBinDir();
 	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
@@ -114,9 +152,30 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 	const hasBinDir = pathEntries.includes(binDir);
 	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
 
+	// Agent-spawned shells never have a usable stdin (stdio: ["ignore", "pipe", "pipe"]),
+	// so any interactive prompt opened via /dev/tty is a guaranteed hang until killed:
+	// `git commit` without -m launches $EDITOR, credential helpers block waiting for a
+	// password, pagers read the terminal directly. Make those cases fail fast or no-op
+	// instead of hanging.
+	//
+	// These deliberately override inherited terminal settings (an EDITOR=vim inherited
+	// from the launching shell is exactly the hang we are preventing, and stdin is
+	// ignored even for user `!` commands, so an interactive editor can never receive
+	// keystrokes anyway). A user who wants a prompt in a specific command can override
+	// inline (`GIT_EDITOR=vim git commit`), which takes precedence over exported vars.
 	return {
 		...process.env,
 		[pathKey]: updatedPath,
+		GIT_EDITOR: "true",
+		GIT_SEQUENCE_EDITOR: "true",
+		GIT_TERMINAL_PROMPTS: "0",
+		GIT_ASKPASS: "true",
+		SSH_ASKPASS_REQUIRE: "never",
+		EDITOR: "true",
+		VISUAL: "true",
+		PAGER: "cat",
+		GIT_PAGER: "cat",
+		DEBIAN_FRONTEND: "noninteractive",
 	};
 }
 
@@ -191,7 +250,7 @@ export function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
 		// Use taskkill on Windows to kill process tree
 		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+			spawnHidden("taskkill", ["/F", "/T", "/PID", String(pid)], {
 				stdio: "ignore",
 				detached: true,
 			});

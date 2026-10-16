@@ -6,6 +6,9 @@ import {
 	isOwnedSessionWorkerProcess,
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
+import { runRuntimeBootstrap } from "./cli/runtime-bootstrap.js";
+import { consumeSessionIssuerBootstrap } from "./cli/session-issuer-bootstrap.js";
+import { isDaemonWorkerProcess } from "./modes/daemon/daemon-worker-protocol.js";
 import { APP_NAME } from "./config.js";
 
 export async function runCli(): Promise<void> {
@@ -18,10 +21,22 @@ export async function runCli(): Promise<void> {
 	process.title = APP_NAME;
 	process.env.PI_CODING_AGENT = "true";
 	process.emitWarning = (() => {}) as typeof process.emitWarning;
+	if (!isDaemonWorkerProcess()) await consumeSessionIssuerBootstrap();
 
 	installOwnedSessionWorkerOwnerWatch();
 
 	const args = process.argv.slice(2);
+	if (args.length === 1 && args[0] === "--prime-agent-bootstrap") {
+		try {
+			await runRuntimeBootstrap();
+		} catch (error) {
+			console.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		} finally {
+			closeOwnedSessionWorkerOwnerWatch();
+		}
+		return;
+	}
 	const handledByOwnedWorker = await maybeRunOwnedSessionWorkerFrontend(args);
 	if (!handledByOwnedWorker) {
 		if (!isOwnedSessionWorkerProcess()) {

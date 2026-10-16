@@ -1,6 +1,16 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel,
+	createDelegatedProviderAdapter,
+	getDelegatedProviderOptionsFromEnvironment,
+	installDelegatedProviderAdapters,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	streamSimple,
+	supportsFastMode,
+} from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
@@ -12,7 +22,7 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
-import { findInitialModel } from "./model-resolver.js";
+import { findInitialModel, findSessionModelWithReadinessWait } from "./model-resolver.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
@@ -92,6 +102,8 @@ export type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
+	KernelHostRequestHandler,
+	KernelHostRequestRegistration,
 	SlashCommandInfo,
 	SlashCommandSource,
 	ToolDefinition,
@@ -143,6 +155,8 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const delegatedBroker = getDelegatedProviderOptionsFromEnvironment();
+	const delegatedAdapter = delegatedBroker ? createDelegatedProviderAdapter(delegatedBroker) : undefined;
 	const cwd = options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
@@ -182,8 +196,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let modelFallbackMessage: string | undefined;
 
 	if (!model && hasExistingSession && existingSession.model) {
-		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
-		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
+		// The saved model may be missing only because the Prime Inference
+		// catalog/auth refresh has not settled yet (e.g. right after a daemon
+		// restart). Give the pending refreshes a bounded window, then retry the
+		// lookup once before falling back to another model.
+		const restoredModel = await findSessionModelWithReadinessWait(
+			modelRegistry,
+			existingSession.model.provider,
+			existingSession.model.modelId,
+		);
+		if (restoredModel) {
 			model = restoredModel;
 		}
 		if (!model) {
@@ -284,18 +306,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const auth = await modelRegistry.getApiKeyAndHeaders(model);
+			if (delegatedAdapter) return delegatedAdapter.streamSimple(model, context, options as SimpleStreamOptions);
+			const auth = await modelRegistry.getApiKeyAndHeaders(model, options?.headers);
 			if (!auth.ok) {
 				throw new Error(auth.error);
 			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			return streamSimple(model, context, {
+			const requestModel = auth.requestModel ?? model;
+			return streamSimple(requestModel, context, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+				headers: auth.headers,
 			});
 		},
 		onPayload: async (payload, _model) => {
@@ -326,7 +348,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
 	if (hasExistingSession) {
@@ -370,6 +391,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
@@ -377,6 +400,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 	});
+	if (delegatedBroker) installDelegatedProviderAdapters(delegatedBroker);
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

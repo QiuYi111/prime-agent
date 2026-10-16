@@ -248,6 +248,21 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send direct transport discovery to a daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+
+		await expect(
+			client.request({ type: "get_direct_worker_transport", activeSessionId: "active-1" }),
+		).rejects.toThrow("does not support direct_peer_transport");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
@@ -370,6 +385,33 @@ describe("DaemonClient", () => {
 		);
 		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 
+		client.close();
+	});
+
+	it.each([false, true])("handles the response before coalesced records (callback throws=%s)", async (throws) => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+		const order: string[] = [];
+		client.onMessage((message) => order.push(message.type));
+		const request = client.request({ type: "attach", activeSessionId: "active-1" }, 30000, {
+			onResponse: () => {
+				order.push("response");
+				if (throws) throw new Error("response callback failed");
+			},
+		});
+		const { id } = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id, type: "response", command: "attach", success: true })}\n` +
+				`${JSON.stringify({ type: "session_detached", activeSessionId: "active-1" })}\n`,
+		);
+		expect(order).toEqual(["response", "session_detached"]);
+		if (throws) await expect(request).rejects.toThrow("response callback failed");
+		else await expect(request).resolves.toMatchObject({ id, success: true });
 		client.close();
 	});
 
@@ -544,6 +586,75 @@ describe("DaemonClient", () => {
 		expect(listenerMessages).toEqual([]);
 
 		unsubscribe();
+		client.close();
+	});
+
+	it("accepts an errored task state on the saved-session list wire", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+
+		const connect = client.connect();
+		expect(netMock.sockets).toHaveLength(1);
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		let discoveredStatus: unknown;
+		const response = client.request(
+			{ type: "list_saved_sessions", activeSessionId: "active-1", scope: "current" },
+			30000,
+			{
+				onProgress: (message) => {
+					if (message.type === "session_list_item") {
+						discoveredStatus = message.session.agentStatus;
+					}
+				},
+			},
+		);
+		expect(socket.writes).toHaveLength(1);
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { id?: string };
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "session_list_item",
+				command: "list_saved_sessions",
+				activeSessionId: "active-1",
+				session: {
+					path: "/tmp/session-errored.jsonl",
+					id: "session-errored",
+					cwd: "/tmp",
+					created: "2026-01-01T00:00:00.000Z",
+					modified: "2026-01-02T00:00:00.000Z",
+					messageCount: 2,
+					firstMessage: "hello",
+					allMessagesText: "hello",
+					agentStatus: {
+						summary: "Model request failed: 400 enable_thinking not supported",
+						taskState: "error",
+						basedOnMessageCount: 2,
+					},
+				},
+			})}\n`,
+		);
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "list_saved_sessions",
+				success: true,
+				data: { sessions: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ success: true });
+		expect(discoveredStatus).toEqual({
+			summary: "Model request failed: 400 enable_thinking not supported",
+			taskState: "error",
+			basedOnMessageCount: 2,
+		});
 		client.close();
 	});
 

@@ -1,8 +1,10 @@
 import type { AutocompleteProvider, EditorTheme, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import stripAnsi from "strip-ansi";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
+import { initTheme, preloadCodeHighlighter, type ThemeColor, theme } from "../src/modes/interactive/theme/theme.js";
 
 const passthrough = (text: string) => text;
 
@@ -57,6 +59,10 @@ const autocompleteProvider: AutocompleteProvider = {
 };
 
 describe("CustomEditor", () => {
+	beforeAll(async () => {
+		await preloadCodeHighlighter();
+	});
+
 	beforeEach(() => {
 		setKeybindings(new KeybindingsManager());
 		vi.clearAllMocks();
@@ -78,28 +84,41 @@ describe("CustomEditor", () => {
 		expect(editor.getText()).toBe("/");
 	});
 
-	it("inserts a newline for a raw \\n byte instead of firing the ctrl+j edit-diff action", () => {
+	it("inserts a newline for a raw \\n byte instead of firing the conversation detail action", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
-		const toggleEditDiffs = vi.fn();
-		editor.onAction("app.edits.expand", toggleEditDiffs);
+		const cycleDetail = vi.fn();
+		editor.onAction("app.tools.expand", cycleDetail);
 
 		editor.handleInput("a");
 		editor.handleInput("\n");
 		editor.handleInput("b");
 
-		expect(toggleEditDiffs).not.toHaveBeenCalled();
+		expect(cycleDetail).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("a\nb");
 	});
 
-	it("still fires the edit-diff action for kitty CSI-u ctrl+j", () => {
+	it("fires the conversation detail action for kitty CSI-u Ctrl+O", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
-		const toggleEditDiffs = vi.fn();
-		editor.onAction("app.edits.expand", toggleEditDiffs);
+		const cycleDetail = vi.fn();
+		editor.onAction("app.tools.expand", cycleDetail);
 
-		editor.handleInput("\x1b[106;5u");
+		editor.handleInput("\x1b[111;5u");
 
-		expect(toggleEditDiffs).toHaveBeenCalledOnce();
+		expect(cycleDetail).toHaveBeenCalledOnce();
 		expect(editor.getText()).toBe("");
+	});
+
+	it("uses the configured conversation detail binding and releases the old default", () => {
+		const keybindings = new KeybindingsManager({ "app.tools.expand": "ctrl+e" });
+		const editor = new CustomEditor(fakeTui, editorTheme, keybindings);
+		const cycleDetail = vi.fn();
+		editor.onAction("app.tools.expand", cycleDetail);
+		editor.handleInput("\x0f");
+		expect(cycleDetail).not.toHaveBeenCalled();
+		editor.handleInput("\x05");
+		expect(cycleDetail).toHaveBeenCalledOnce();
+		expect(keybindings.getEffectiveConfig()).not.toHaveProperty("app.edits.expand");
+		expect(keybindings.getEffectiveConfig()).not.toHaveProperty("app.thinking.toggle");
 	});
 
 	it("routes Escape through its handler while dismissing autocomplete", async () => {
@@ -265,6 +284,22 @@ describe("CustomEditor", () => {
 		expect(lines[1]).toContain("...");
 	});
 
+	it("updates placeholder and queue header alignment when editor padding changes", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "type to start",
+		});
+		editor.getHeaderLine = () => "queued message";
+
+		for (const padding of [5, 1]) {
+			editor.setPaddingX(padding);
+			const lines = editor.render(40).map((line) => stripAnsi(line));
+
+			expect(lines[1]!.indexOf("queued message")).toBe(padding);
+			expect(lines[3]!.indexOf("type to start")).toBe(padding + 3);
+			expect(lines.every((line) => visibleWidth(line) === 40)).toBe(true);
+		}
+	});
+
 	it("keeps the surface background across truncation resets in the header line", () => {
 		const backgroundColor = (text: string) => `<bg>${text}</bg>`;
 		const editor = new CustomEditor(fakeTui, { ...editorTheme, backgroundColor }, new KeybindingsManager());
@@ -277,6 +312,64 @@ describe("CustomEditor", () => {
 			expect(segment.startsWith("<bg>")).toBe(true);
 			expect(segment.endsWith("</bg>")).toBe(true);
 		}
+	});
+
+	const makeHighlightEditor = (text: string, options?: { isArgumentCommand?: (name: string) => boolean }) => {
+		initTheme("dark");
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), options);
+		editor.setText(text);
+		return editor;
+	};
+
+	it.each<{ name: string; text: string; width: number; color: ThemeColor; has?: string[]; lacks?: string[] }>([
+		{ name: "--flags in the input text", text: "/new --name @a.ts", width: 40, color: "mdLink", has: ["--name"] },
+		{ name: "@paths in the input text", text: "/new --name @a.ts", width: 40, color: "success", has: ["@a.ts"] },
+		{
+			name: "wrapped @path fragments across editor lines",
+			text: "check @src/very-long-file-name.ts please",
+			width: 16,
+			color: "success",
+			has: ["@src/very-lon", "g-file-name.t", "s"],
+		},
+		{
+			name: "quoted @paths across wrapped editor lines",
+			text: 'open @"docs/some very long name.txt" now',
+			width: 16,
+			color: "success",
+			has: ['@"docs/some ', "very long ", 'name.txt"'],
+		},
+		{ name: "no line bleed", text: "@abcde\nfoo bar", width: 11, color: "success", has: ["@abcde"], lacks: ["foo"] },
+	])("highlights $name", ({ text, width, color, has, lacks }) => {
+		const rendered = makeHighlightEditor(text).render(width).join("\n");
+
+		for (const fragment of has ?? []) expect(rendered).toContain(theme.fg(color, fragment));
+		for (const fragment of lacks ?? []) expect(rendered).not.toContain(theme.fg(color, fragment));
+	});
+
+	it("highlights a bare -- separator only for argument commands", () => {
+		const options = { isArgumentCommand: (name: string) => name === "new" };
+		const separator = theme.fg("mdLink", "--");
+
+		expect(makeHighlightEditor("/new --name bla -- hello", options).render(60).join("\n")).toContain(separator);
+		expect(makeHighlightEditor("this -- however -- is fine", options).render(60).join("\n")).not.toContain(separator);
+		expect(makeHighlightEditor("/unknown -- hello", options).render(60).join("\n")).not.toContain(separator);
+	});
+
+	it("does not mis-color visible text matching a scrolled-away token", () => {
+		// 9 lines with the cursor at the end scroll @foo out of view; the visible plain "foo" must stay uncolored.
+		const rendered = makeHighlightEditor("@foo\nhidden\nfoo\nl3\nl4\nl5\nl6\nl7\nl8").render(20).join("\n");
+
+		expect(rendered).toContain("↑ 2 more");
+		expect(rendered).not.toContain(theme.fg("success", "foo"));
+	});
+
+	it("keeps the token tail colored when the cursor sits inside the token", () => {
+		const editor = makeHighlightEditor("check @src/foo.ts");
+		editor.handleInput("\x1b[D");
+		editor.handleInput("\x1b[D");
+
+		// The cursor's full reset sits before the final "s"; the tail must be re-colored.
+		expect(editor.render(40)[1]!).toContain(`\x1b[0m${theme.fg("success", "s")}`);
 	});
 
 	it("renders no header when the callback returns undefined", () => {

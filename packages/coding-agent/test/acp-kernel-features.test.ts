@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import type { KernelManager } from "../src/core/kernel/index.js";
+import type { KernelClient } from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 import { acpUpdatesForSessionEvent } from "../src/modes/acp/acp-events.js";
@@ -13,7 +13,7 @@ import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/
 /**
  * Real-kernel verification for ACP mode.
  *
- * These tests boot an actual IPython kernel (no API key, no network) to prove
+ * These tests boot an actual Python kernel (no API key, no network) to prove
  * the capabilities ACP mode claims to preserve genuinely work, and that the
  * resulting output is representable over ACP. Mapper-level unit tests cannot
  * show that a kernel round trip still holds state or that harness CRUD runs.
@@ -42,7 +42,7 @@ function toolEndEvent(toolCallId: string, output: string, isError = false): Agen
 	} as AgentConnectionSessionEvent;
 }
 
-describe("ACP mode over a real IPython kernel", () => {
+describe("ACP mode over a real Python kernel", () => {
 	let tempDir: string;
 	let provisioner: IpythonKernelProvisioner | undefined;
 
@@ -57,7 +57,7 @@ describe("ACP mode over a real IPython kernel", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("keeps IPython state across cells and represents each cell as an ACP execute call", {
+	it("keeps Python state across cells and represents each cell as an ACP execute call", {
 		tags: ["kernel-heavy"],
 		timeout: 180_000,
 	}, async () => {
@@ -65,7 +65,7 @@ describe("ACP mode over a real IPython kernel", () => {
 		// is shared, and a skill-less kernel here can leave a later skill-dependent
 		// test with an unsynced venv when files run concurrently.
 		provisioner = new IpythonKernelProvisioner(tempDir, { pythonSkills: [AGENT_MESSAGE_SKILL] });
-		const manager: KernelManager = await provisioner.ensure();
+		const manager: KernelClient = await provisioner.ensure();
 
 		const first = await manager.execute("acp_state = 41\nprint('set')");
 		expect(first.status).toBe("ok");
@@ -217,11 +217,6 @@ print(json.dumps({
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [AGENT_MESSAGE_SKILL],
 			hostHandlers: {
-				// The family roster: parent, siblings, and children of this agent.
-				"agent_message.list_agents": async () => ({
-					current: { name: "root", id: "session-alpha", depth: 0 },
-					entries: [{ relationship: "child", name: "reviewer", id: "session-beta", depth: 1, status: "idle" }],
-				}),
 				"agent_message.send": async (payload) => ({
 					id: "agentmsg-acp",
 					source: "agent_message",
@@ -247,16 +242,11 @@ print(json.dumps({
 
 		const result = await manager.execute(`
 import json
-roster = await agent_message.list_agents()
 receipt = await agent_message.send("status update", receiver_role="child", receiver_name="reviewer")
-print(json.dumps({
-    "roster": [e["name"] for e in roster["entries"]],
-    "status": receipt["deliveryStatus"],
-}))
+print(json.dumps({"status": receipt["deliveryStatus"]}))
 `);
 		expect(result.status, why(result)).toBe("ok");
 		const payload = JSON.parse(result.stdout.trim());
-		expect(payload.roster).toEqual(["reviewer"]);
 		expect(payload.status).toBe("queued");
 
 		// The kernel reports the send; ACP carries it as namespaced metadata.

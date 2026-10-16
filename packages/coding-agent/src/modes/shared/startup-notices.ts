@@ -7,9 +7,9 @@
  * identical wording.
  */
 
-import { spawn } from "node:child_process";
 import { DefaultPackageManager } from "../../core/package-manager.js";
 import type { SettingsManager } from "../../core/settings-manager.js";
+import { spawnHidden } from "../../utils/child-process.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import { theme } from "../interactive/theme/theme.js";
 
@@ -32,7 +32,7 @@ export interface StartupNoticeCheckOptions {
 /** Run every startup check in parallel and collect the results. */
 export async function gatherStartupNotices(options: StartupNoticeCheckOptions): Promise<StartupNotices> {
 	const [newVersion, packageUpdates, tmuxWarning] = await Promise.all([
-		checkForNewPiVersion(options.version),
+		checkForNewPiVersion(options.version, options.settingsManager.getUpdateChannel()),
 		checkForPackageUpdates(options),
 		checkTmuxKeyboardSetup(),
 	]);
@@ -66,7 +66,7 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 
 	const runTmuxShow = (option: string): Promise<string | undefined> => {
 		return new Promise((resolve) => {
-			const proc = spawn("tmux", ["show", "-gv", option], {
+			const proc = spawnHidden("tmux", ["show", "-gv", option], {
 				stdio: ["ignore", "pipe", "ignore"],
 			});
 			let stdout = "";
@@ -110,7 +110,7 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 
 export function formatUpdateAvailableNotice(newVersion: string): string {
 	return (
-		`${theme.bold(theme.fg("accent", "Update available:"))} ` +
+		`${theme.fg("accent", "Update available:")} ` +
 		`${theme.fg("muted", `v${newVersion}. Run `)}${theme.fg("accent", "/update")}`
 	);
 }
@@ -118,7 +118,7 @@ export function formatUpdateAvailableNotice(newVersion: string): string {
 export function formatPackageUpdateNotice(packages: string[]): string {
 	const packageList = packages.join(", ");
 	return (
-		`${theme.bold(theme.fg("warning", "Package updates available:"))} ` +
+		`${theme.fg("warning", "Package updates available:")} ` +
 		`${theme.fg("muted", `${packageList}. Run `)}${theme.fg("accent", "/update --extensions")}`
 	);
 }

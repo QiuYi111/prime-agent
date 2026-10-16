@@ -26,7 +26,6 @@ type FakeInteractiveMode = {
 		retryAttempt: number;
 		sessionActions: { queuedCount: number; steering: readonly string[]; followUps: readonly string[] };
 	};
-	connectionQueue: { steering: string[]; followUp: string[] };
 	agentConnection: {
 		abort: Mock;
 		clearQueue: Mock;
@@ -37,7 +36,8 @@ type FakeInteractiveMode = {
 		abortBash: Mock;
 	};
 	subagentSummaryLine: { invalidate: Mock };
-	ui: { requestRender: Mock; onDebug?: () => void };
+	editorContainer: { children: unknown[] };
+	ui: { requestRender: Mock; onDebug?: () => void; hasOverlay: () => boolean };
 	updatePendingMessagesDisplay: Mock;
 	showError: Mock;
 	showTreeSelector: Mock;
@@ -98,7 +98,6 @@ function createInteractiveFake(options: {
 			retryAttempt: options.retryAttempt ?? 0,
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		},
-		connectionQueue: { steering: [], followUp: [] },
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
@@ -109,7 +108,8 @@ function createInteractiveFake(options: {
 			abortBash: vi.fn(),
 		},
 		subagentSummaryLine: { invalidate: vi.fn() },
-		ui: { requestRender: vi.fn() },
+		editorContainer: { children: [editor] },
+		ui: { requestRender: vi.fn(), hasOverlay: () => false },
 		queueSelection: { isBrowsing: false, reset: () => "" },
 		updatePendingMessagesDisplay: vi.fn(),
 		showError: vi.fn(),
@@ -172,7 +172,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 	it("preserves the queue and the draft when interrupting streaming", () => {
 		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
-		mode.connectionQueue = { steering: ["steer"], followUp: ["follow"] };
+		mode.connectionState.sessionActions = { queuedCount: 2, steering: ["steer"], followUps: ["follow"] };
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
@@ -180,7 +180,11 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.agentConnection.abortAndClearQueue).not.toHaveBeenCalled();
 		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
 		expect(mode.editor.getText()).toBe("draft");
-		expect(mode.connectionQueue).toEqual({ steering: ["steer"], followUp: ["follow"] });
+		expect(mode.connectionState.sessionActions).toEqual({
+			queuedCount: 2,
+			steering: ["steer"],
+			followUps: ["follow"],
+		});
 	});
 
 	it("exits on the second Ctrl+C while the hint is visible", () => {

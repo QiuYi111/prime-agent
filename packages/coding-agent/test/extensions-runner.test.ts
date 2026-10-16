@@ -183,7 +183,7 @@ describe("ExtensionRunner", () => {
 		it("blocks shortcuts when reserved key is also bound to non-reserved actions", async () => {
 			const extCode = `
 				export default function(pi) {
-					pi.registerShortcut("ctrl+t", {
+					pi.registerShortcut("ctrl+o", {
 						description: "Conflicts with shared reserved default",
 						handler: async () => {},
 					});
@@ -195,10 +195,39 @@ describe("ExtensionRunner", () => {
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			const shortcuts = runner.getShortcuts(defaultKeybindings);
+			const keybindings = { ...defaultKeybindings, "app.clipboard.pasteImage": "ctrl+o" as KeyId };
+			const shortcuts = runner.getShortcuts(keybindings);
 
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in"));
-			expect(shortcuts.has("ctrl+t")).toBe(false);
+			expect(shortcuts.has("ctrl+o")).toBe(false);
+
+			warnSpy.mockRestore();
+		});
+
+		it("blocks extension overrides of model cycling keys", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerShortcut("alt+m", {
+						description: "Steals cycle forward",
+						handler: async () => {},
+					});
+					pi.registerShortcut("shift+alt+m", {
+						description: "Steals cycle backward",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "cycle-steal.ts"), extCode);
+
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const shortcuts = runner.getShortcuts(defaultKeybindings);
+
+			expect(shortcuts.has("alt+m")).toBe(false);
+			expect(shortcuts.has("shift+alt+m")).toBe(false);
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in"));
 
 			warnSpy.mockRestore();
 		});
@@ -468,6 +497,183 @@ describe("ExtensionRunner", () => {
 			expect(errors.length).toBe(1);
 			expect(errors[0].error).toContain("Handler error!");
 			expect(errors[0].event).toBe("context");
+		});
+	});
+
+	describe("host timers", () => {
+		it("reports a throwing ctx timer callback and keeps other extensions' timers running", async () => {
+			const firedMarker = path.join(tempDir, "other-timer-fired");
+			fs.writeFileSync(
+				path.join(extensionsDir, "throwing-timer.ts"),
+				`export default function(pi) {
+					pi.on("context", async (_event, ctx) => {
+						ctx.setTimeout(() => { throw new Error("timer boom"); }, 5);
+						// Userland thenable (not a native Promise): its rejection must land in the boundary too.
+						ctx.setTimeout(() => ({ then(_resolve, reject) { reject(new Error("thenable boom")); } }), 5);
+					});
+				}`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "healthy-timer.ts"),
+				`import * as fs from "node:fs";
+				export default function(pi) {
+					pi.on("context", async (_event, ctx) => {
+						ctx.setTimeout(() => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired"), 5);
+					});
+				}`,
+			);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError((err) => errors.push(err));
+
+			vi.useFakeTimers();
+			try {
+				await runner.emitContext([]);
+				await expect(vi.advanceTimersByTimeAsync(10)).resolves.not.toThrow();
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(errors).toHaveLength(2);
+			for (const error of errors) {
+				expect(error.extensionPath).toContain("throwing-timer");
+				expect(error.event).toBe("setTimeout");
+			}
+			expect(errors.map((error) => error.error).sort()).toEqual(["thenable boom", "timer boom"]);
+			expect(fs.existsSync(firedMarker)).toBe(true);
+		});
+
+		it("reports a throwing adopted timer callback through the adopting runner", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "adopted-throwing-timer.ts"),
+				`export default function(pi) {
+					pi.on("context", async (_event, ctx) => {
+						ctx.setTimeout(() => { throw new Error("adopted boom"); }, 5);
+					});
+				}`,
+			);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const oldRunner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			const newRunner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			const oldErrors: string[] = [];
+			const newErrors: string[] = [];
+			oldRunner.onError((err) => oldErrors.push(err.error));
+			newRunner.onError((err) => newErrors.push(err.error));
+
+			vi.useFakeTimers();
+			try {
+				await oldRunner.emitContext([]);
+				newRunner.adoptHostTimers(oldRunner);
+				vi.advanceTimersByTime(10);
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(oldErrors).toEqual([]);
+			expect(newErrors).toEqual(["adopted boom"]);
+		});
+
+		it("cancels pending ctx timers on invalidate so nothing fires after unload", async () => {
+			const firedMarker = path.join(tempDir, "post-unload-fired");
+			fs.writeFileSync(
+				path.join(extensionsDir, "pending-timers.ts"),
+				`import * as fs from "node:fs";
+				export default function(pi) {
+					pi.on("context", async (_event, ctx) => {
+						const fire = () => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired");
+						ctx.setTimeout(fire, 5);
+						ctx.setInterval(fire, 5);
+					});
+				}`,
+			);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			vi.useFakeTimers();
+			try {
+				await runner.emitContext([]);
+				runner.invalidate();
+				vi.advanceTimersByTime(50);
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(fs.existsSync(firedMarker)).toBe(false);
+		});
+
+		it("cannot reactivate a fired ctx timeout via handle.refresh()", async () => {
+			// Real timers on purpose: the guarantee rides on native Node clearTimeout semantics, which fake timers do not reproduce.
+			const countFile = path.join(tempDir, "refresh-fire-count");
+			fs.writeFileSync(
+				path.join(extensionsDir, "refreshing-timer.ts"),
+				`import * as fs from "node:fs";
+				export default function(pi) {
+					let handle;
+					pi.on("context", async (_event, ctx) => {
+						if (!handle) {
+							handle = ctx.setTimeout(() => {
+								const count = fs.existsSync(${JSON.stringify(countFile)}) ? Number(fs.readFileSync(${JSON.stringify(countFile)}, "utf8")) : 0;
+								fs.writeFileSync(${JSON.stringify(countFile)}, String(count + 1));
+							}, 5);
+						} else {
+							handle.refresh();
+						}
+					});
+				}`,
+			);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			await runner.emitContext([]);
+			await vi.waitFor(() => expect(fs.existsSync(countFile)).toBe(true));
+			await runner.emitContext([]);
+			await new Promise((resolve) => setTimeout(resolve, 40));
+
+			expect(fs.readFileSync(countFile, "utf8")).toBe("1");
+		});
+
+		it("clears a pending timer via ctx.clearTimeout", async () => {
+			const firedMarker = path.join(tempDir, "cleared-timer-fired");
+			fs.writeFileSync(
+				path.join(extensionsDir, "clearing-timer.ts"),
+				`import * as fs from "node:fs";
+				export default function(pi) {
+					pi.on("context", async (_event, ctx) => {
+						const handle = ctx.setTimeout(() => fs.writeFileSync(${JSON.stringify(firedMarker)}, "fired"), 5);
+						ctx.clearTimeout(handle);
+					});
+				}`,
+			);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			vi.useFakeTimers();
+			try {
+				await runner.emitContext([]);
+				vi.advanceTimersByTime(50);
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(fs.existsSync(firedMarker)).toBe(false);
 		});
 	});
 

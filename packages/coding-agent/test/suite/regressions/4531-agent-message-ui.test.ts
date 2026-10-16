@@ -23,7 +23,7 @@ import {
 import { IPythonCellComponent } from "../../../src/modes/interactive/components/ipython-cell.js";
 import { formatQueuedMessagePreview, InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
-import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
+import { conversationMessages, createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
 
 function createPayload(message: string): AgentSessionMessagePayload {
 	return {
@@ -48,6 +48,7 @@ function stripAnsi(text: string): string {
 }
 
 function render(component: AgentMessageComponent): string {
+	component.setExpanded(true);
 	return stripAnsi(component.render(120).join("\n"));
 }
 
@@ -89,7 +90,7 @@ describe("ENG-4531 agent message UI", () => {
 		await harness.session.agent.waitForIdle();
 
 		expect(getUserTexts(harness)).toEqual([]);
-		expect(harness.session.messages[0]).toMatchObject({
+		expect(conversationMessages(harness.session)[0]).toMatchObject({
 			role: "custom",
 			customType: "agent_message",
 			display: true,
@@ -113,7 +114,7 @@ describe("ENG-4531 agent message UI", () => {
 		await harness.session.agent.waitForIdle();
 
 		expect(getUserTexts(harness)).toEqual([prompt]);
-		expect(harness.session.messages[0]?.role).toBe("user");
+		expect(conversationMessages(harness.session)[0]?.role).toBe("user");
 	});
 
 	it("preserves structured messages passed through the normal prompt path", async () => {
@@ -130,7 +131,7 @@ describe("ENG-4531 agent message UI", () => {
 		await harness.session.agent.waitForIdle();
 
 		expect(getUserTexts(harness)).toEqual([]);
-		expect(harness.session.messages[0]).toMatchObject({
+		expect(conversationMessages(harness.session)[0]).toMatchObject({
 			role: "custom",
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Run the idle-session review." },
@@ -152,7 +153,9 @@ describe("ENG-4531 agent message UI", () => {
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Use shard seven." },
 		});
-		expect(harness.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt)).toEqual({
+		// New-format prompts carry no id in text: clearing keys on the queued customMessage's customType.
+		expect(isAgentSessionMessagePrompt(prompt)).toBe(false);
+		expect(harness.session.clearQueuedAgentMessages()).toEqual({
 			steering: [],
 			followUp: [prompt],
 		});
@@ -335,6 +338,7 @@ describe("ENG-4531 agent message UI", () => {
 			ui: { requestRender: () => {} } as unknown as TUI,
 			cwd: "/tmp",
 			toolOptions: {},
+			toolsExpanded: true,
 			getToolDefinition: () => undefined,
 		});
 
@@ -343,7 +347,7 @@ describe("ENG-4531 agent message UI", () => {
 		expect(render(components[0] as AgentMessageComponent)).toContain("Agent message received · from parent Planner");
 	});
 
-	it("uses compact rebuilt spacing for agent messages next to messages and tool cells", () => {
+	it.each([false, true])("uses mode-aware rebuilt agent-message spacing with all output=%s", (expanded) => {
 		const first = createAgentSessionMessage(createPayload("First notification."));
 		const second = createAgentSessionMessage({ ...createPayload("Second notification."), id: "agentmsg_4531_2" });
 		const toolCall = fauxAssistantMessage(fauxToolCall("ipython", { code: "print('ready')" }), {
@@ -353,6 +357,7 @@ describe("ENG-4531 agent message UI", () => {
 			ui: { requestRender: () => {} } as unknown as TUI,
 			cwd: "/tmp",
 			toolOptions: {},
+			toolsExpanded: expanded,
 			getToolDefinition: () => undefined,
 		};
 
@@ -360,13 +365,13 @@ describe("ENG-4531 agent message UI", () => {
 
 		const adjacent = buildConversationComponents([first, second], options);
 		expect(adjacent).toHaveLength(2);
-		expect(adjacent[0]?.render(120)[0]).toBe("");
-		expect(adjacent[1]?.render(120)[0]).not.toBe("");
+		expect(adjacent[0]?.render(120)[0] === "").toBe(!expanded);
+		expect(adjacent[1]?.render(120)[0] === "").toBe(expanded);
 
 		const toolThenMessage = buildConversationComponents([toolCall, second], options);
-		expect(toolThenMessage.at(-1)?.render(120)[0]).not.toBe("");
+		expect(toolThenMessage.at(-1)?.render(120)[0] === "").toBe(expanded);
 		const messageThenTool = buildConversationComponents([first, toolCall], options);
-		expect(messageThenTool.at(-1)?.render(120)[0]).not.toBe("");
+		expect(messageThenTool.at(-1)?.render(120)[0] === "").toBe(expanded);
 
 		const userThenMessage = buildConversationComponents(
 			[{ role: "user", content: "intervening prompt", timestamp: 123 }, second] as AgentMessage[],
@@ -381,11 +386,12 @@ describe("ENG-4531 agent message UI", () => {
 		expect(assistantThenMessage[1]?.render(120)[0]).toBe("");
 	});
 
-	it("suppresses live spacing between agent messages and following tool activity", () => {
+	it.each([false, true])("uses mode-aware live agent-message spacing with all output=%s", (expanded) => {
 		const chatContainer = new Container();
 		const mode = {
 			chatContainer,
-			toolOutputExpanded: false,
+			toolOutputExpanded: expanded,
+			getCurrentCwd: () => "/tmp",
 			getMarkdownThemeWithSettings: () => undefined,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -396,8 +402,8 @@ describe("ENG-4531 agent message UI", () => {
 
 		addMessage(first);
 		addMessage(second);
-		expect(chatContainer.children[0]?.render(120)[0]).toBe("");
-		expect(chatContainer.children[1]?.render(120)[0]).not.toBe("");
+		expect(chatContainer.children[0]?.render(120)[0] === "").toBe(!expanded);
+		expect(chatContainer.children[1]?.render(120)[0] === "").toBe(expanded);
 
 		addMessage(fauxAssistantMessage(fauxToolCall("ipython", { code: "print('live')" }), { stopReason: "toolUse" }));
 		expect(chatContainer.children[2]?.render(120)[0]).not.toBe("");
@@ -408,6 +414,7 @@ describe("ENG-4531 agent message UI", () => {
 				ui: { requestRender: () => {} } as unknown as TUI,
 				cwd: "/tmp",
 				toolOptions: {},
+				toolsExpanded: expanded,
 				getToolDefinition: () => undefined,
 			},
 		);
@@ -415,7 +422,7 @@ describe("ENG-4531 agent message UI", () => {
 		if (!toolComponent) throw new Error("Missing tool component");
 		chatContainer.addChild(toolComponent);
 		addMessage(second);
-		expect(chatContainer.children[4]?.render(120)[0]).not.toBe("");
+		expect(chatContainer.children[4]?.render(120)[0] === "").toBe(expanded);
 
 		chatContainer.addChild(new Container());
 		addMessage(second);
@@ -471,69 +478,25 @@ describe("ENG-4531 agent message UI", () => {
 		expect(render(expanded)).toContain("Agent message received · from sibling Peer");
 	});
 
-	it("renders a compact row and an aligned multiline gutter when expanded", () => {
+	it("keeps the received notice compact and reveals its multiline body only in all output", () => {
 		const body = "Reply to your parent with exactly: hi\nThen wait for more work.";
 		const component = new AgentMessageComponent(createAgentSessionMessage(createPayload(body)));
-		const collapsed = render(component);
-
-		expect(collapsed).toContain("◆ Agent message received · from Planner");
-		expect(collapsed).toContain("to expand");
-		expect(collapsed).not.toContain("Then wait for more work.");
+		expect(component.render(120).map((line) => stripAnsi(line).trimEnd())).toEqual([
+			"",
+			" ◆ Agent message received · from Planner",
+		]);
 
 		component.setExpanded(true);
 		const expanded = render(component);
-		expect(expanded).toContain("to collapse");
+		expect(expanded).not.toContain("to collapse");
 		const expandedLines = expanded.split("\n");
-		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ Agent message received · from Planner \(.*to collapse\)$/);
+		expect(expandedLines[1]?.trimEnd()).toBe(" ◆ Agent message received · from Planner");
 		expect(expandedLines.slice(2)).toEqual([
 			" ╰─ Reply to your parent with exactly: hi",
 			"    Then wait for more work.",
 		]);
 		expect(expanded).not.toContain("Source: agent_message");
 		expect(expanded).not.toContain("Message id:");
-	});
-
-	it("renders sent messages beneath collapsed Python cells", () => {
-		const component = new IPythonCellComponent({
-			code: 'await agent_message.send("worker-active", "Review shard seven.")',
-			executionStarted: true,
-			details: {
-				status: "ok",
-				sentAgentMessages: [
-					{
-						id: "agentmsg_4531",
-						message: "Review shard seven.",
-						deliveryStatus: "queued",
-						receiverRole: "child",
-						target: {
-							activeSessionId: "worker-active",
-							sessionId: "worker-session",
-							sessionName: "Worker",
-						},
-					},
-					{
-						id: "agentmsg_4531_delivered",
-						message: "Continue with shard eight.",
-						deliveryStatus: "delivered",
-						receiverRole: "parent",
-						target: {
-							activeSessionId: "worker-active",
-							sessionId: "worker-session",
-							sessionName: "Worker",
-						},
-					},
-				],
-			},
-		});
-
-		const rendered = stripAnsi(component.render(120).join("\n"));
-		const lines = rendered.split("\n");
-		expect(lines).toEqual([
-			expect.stringContaining("python"),
-			" ◆ Agent message queued · to child Worker · Review shard seven.",
-			" ◆ Agent message sent · to parent Worker · Continue with shard eight.",
-		]);
-		expect(rendered).not.toContain("Agent message received");
 	});
 
 	it("expands sent messages to the message text without the receipt metadata", () => {
@@ -549,7 +512,6 @@ describe("ENG-4531 agent message UI", () => {
 			executionStarted: true,
 			argsComplete: true,
 			expanded: true,
-			agentMessagesExpanded: true,
 			details: {
 				status: "ok",
 				result: receipt,
@@ -594,7 +556,6 @@ describe("ENG-4531 agent message UI", () => {
 			executionStarted: true,
 			argsComplete: true,
 			expanded: true,
-			agentMessagesExpanded: true,
 			details: {
 				status: "ok",
 				result: receipts,
@@ -625,7 +586,6 @@ describe("ENG-4531 agent message UI", () => {
 			executionStarted: true,
 			argsComplete: true,
 			expanded: true,
-			agentMessagesExpanded: true,
 			details: {
 				status: "ok",
 				result: "{'referenced_message': 'agentmsg_4531_ref', 'answer': 42}",
@@ -655,7 +615,6 @@ describe("ENG-4531 agent message UI", () => {
 			executionStarted: true,
 			argsComplete: true,
 			expanded: true,
-			agentMessagesExpanded: true,
 			details: {
 				status: "ok",
 				result: "'done'",
@@ -681,7 +640,7 @@ describe("ENG-4531 agent message UI", () => {
 		expect(rendered).toContain("done");
 	});
 
-	it("decouples sent-message expansion from tool-output expansion", () => {
+	it("keeps sent notices compact until all output reveals their bodies", () => {
 		const sentAgentMessage = {
 			id: "agentmsg_4531_decoupled",
 			message: "Decouple me.",
@@ -700,21 +659,13 @@ describe("ENG-4531 agent message UI", () => {
 			details: { status: "ok", sentAgentMessages: [sentAgentMessage] },
 		};
 
-		const agentExpanded = stripAnsi(
-			new IPythonCellComponent({ ...baseState, expanded: false, agentMessagesExpanded: true })
-				.render(120)
-				.join("\n"),
-		);
-		expect(agentExpanded).toContain(" ◆ Agent message sent · to parent Worker");
-		expect(agentExpanded).toContain(" ╰─ Decouple me.");
-		expect(agentExpanded).not.toContain("· Decouple me.");
+		const collapsed = stripAnsi(new IPythonCellComponent({ ...baseState, expanded: false }).render(120).join("\n"));
+		expect(collapsed).toContain("◆ Agent message sent · to parent Worker");
+		expect(collapsed.split("\n")).toHaveLength(2);
+		expect(collapsed).not.toContain("╰─ Decouple me.");
 
-		const toolExpanded = stripAnsi(
-			new IPythonCellComponent({ ...baseState, expanded: true, agentMessagesExpanded: false })
-				.render(120)
-				.join("\n"),
-		);
-		expect(toolExpanded).toContain(" ◆ Agent message sent · to parent Worker · Decouple me.");
-		expect(toolExpanded).not.toContain("╰─");
+		const toolExpanded = stripAnsi(new IPythonCellComponent({ ...baseState, expanded: true }).render(120).join("\n"));
+		expect(toolExpanded).toContain(" ◆ Agent message sent · to parent Worker");
+		expect(toolExpanded).toContain("╰─ Decouple me.");
 	});
 });

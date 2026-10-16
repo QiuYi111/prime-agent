@@ -5,7 +5,6 @@
  * the heavy main module graph loads. main.ts reuses the same memoized promise.
  */
 
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
@@ -23,7 +22,14 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
-import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
+import { spawnHidden } from "../utils/child-process.js";
+import { isHelpCommandRequest, REMOVED_COMMAND_NAMES } from "./command-registry.js";
+import {
+	extractHelpCommandPath,
+	findFirstPositionalArgument,
+	isCommandPositional,
+	PROMPT_RUN_FLAGS,
+} from "./global-flags.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
@@ -64,10 +70,19 @@ async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promis
 type DaemonVersionProbe =
 	| { status: "absent" }
 	| { status: "current"; hello: DaemonHello }
-	| { status: "stale"; hello?: DaemonHello };
+	| { status: "stale"; hello: DaemonHello }
+	| { status: "unresponsive" };
+
+function isCurrentDaemonHello(hello: DaemonHello): boolean {
+	return (
+		hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
+		hello.schemaId === DAEMON_SCHEMA_ID &&
+		hello.appVersion === VERSION
+	);
+}
 
 /** Connect to a running daemon and check whether it matches this client's protocol and app version. */
-export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
+export async function probeDaemonVersion(socketPath: string, helloTimeoutMs = 2000): Promise<DaemonVersionProbe> {
 	let client: DaemonClient | undefined;
 	for (const timeoutMs of [250, 2000]) {
 		const candidate = new DaemonClient(socketPath);
@@ -83,11 +98,8 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		return { status: "absent" };
 	}
 	try {
-		const hello = await client.waitForHello(2000);
-		const current =
-			hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
-			hello.schemaId === DAEMON_SCHEMA_ID &&
-			hello.appVersion === VERSION;
+		const hello = await client.waitForHello(helloTimeoutMs);
+		const current = isCurrentDaemonHello(hello);
 		if (!current) {
 			logDaemonLaunch(
 				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
@@ -100,9 +112,9 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		}
 		return { status: "stale", hello };
 	} catch {
-		// Connected but no recognizable greeting: assume a stale daemon.
-		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; treating as stale`);
-		return { status: "stale" };
+		// The supervisor accepts connections before startup and worker adoption finish.
+		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; waiting for startup`);
+		return { status: "unresponsive" };
 	} finally {
 		client.close();
 	}
@@ -301,50 +313,70 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 
 // Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
 // session blocks replacing a stale daemon.
-async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean> {
+type StaleDaemonDisposition = "current" | "stopped" | "busy";
+
+async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<StaleDaemonDisposition> {
 	const client = new DaemonClient(socketPath);
-	let connected = false;
-	let hasBusySessions = false;
-	let loadedSessionCount = 0;
 	try {
 		await client.connect(1000);
-		connected = true;
-		try {
-			const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
-			loadedSessionCount = result.sessions.length;
-			hasBusySessions =
-				result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));
-		} catch {
-			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
-			hasBusySessions = true;
-		}
 	} catch {
-		// Couldn't reach it to inspect; don't send a blind shutdown, just verify below.
-	} finally {
 		client.close();
+		return (await waitForDaemonGone(socketPath)) ? "stopped" : "busy";
 	}
 
-	if (!connected) {
-		return waitForDaemonGone(socketPath);
+	let loadedSessionCount = 0;
+	let hasBusySessions = true;
+	try {
+		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+		loadedSessionCount = result.sessions.length;
+		hasBusySessions =
+			result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));
+	} catch {
+		// An unresponsive daemon is not safe to replace.
+	}
+
+	const hello = client.hello;
+	if (hello && isCurrentDaemonHello(hello)) {
+		client.close();
+		logDaemonLaunch(`daemon on ${socketPath} finished starting while staleness was being checked; reusing it`);
+		return "current";
 	}
 	if (hasBusySessions) {
+		client.close();
 		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: busy session(s) present`);
-		return false;
+		return "busy";
 	}
 	logDaemonLaunch(
 		`replacing stale daemon on ${socketPath} (idle): ${loadedSessionCount} loaded session(s) will reload`,
 	);
-	return shutdownDaemonAndWait(socketPath);
+	return (await shutdownConnectedDaemonAndWait(client, socketPath, 5000, hello)) ? "stopped" : "busy";
 }
 
 async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
-	const probe = await probeDaemonVersion(socketPath);
+	const probeStartedAt = Date.now();
+	let probe = await probeDaemonVersion(socketPath);
+	if (probe.status === "unresponsive") {
+		const remainingStartupMs = Math.max(1, DAEMON_STARTUP_TIMEOUT_MS - (Date.now() - probeStartedAt));
+		probe = await probeDaemonVersion(socketPath, remainingStartupMs);
+	}
 	if (probe.status === "current") {
 		return;
 	}
+	if (probe.status === "unresponsive") {
+		throw new Error(
+			`Prime Agent daemon on ${socketPath} accepted connections but did not finish startup within ${DAEMON_STARTUP_TIMEOUT_MS / 1000} seconds. ` +
+				`It was left running to avoid interrupting active work.
+
+Run:
+${formatCurrentCliCommand(["shutdown", "--force"])}
+
+Then retry the original command.`,
+		);
+	}
 	if (probe.status === "stale") {
-		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
-		if (!stopped) throw new StaleDaemonError(socketPath, probe.hello);
+		const disposition = await shutdownStaleDaemonIfNotBusy(socketPath);
+		if (disposition === "current") return;
+		if (disposition === "busy") throw new StaleDaemonError(socketPath, probe.hello);
 	}
 
 	const entrypoint = process.argv[1];
@@ -368,7 +400,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
 	const logOffset = currentDaemonLogSize(socketPath);
-	const child = spawn(
+	const child = spawnHidden(
 		process.execPath,
 		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
 		{
@@ -479,59 +511,6 @@ export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: st
 }
 
 const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
-const EARLY_LAUNCH_VALUE_FLAGS = new Set([
-	"--mode",
-	"--daemon-socket",
-	"--provider",
-	"--model",
-	"--api-key",
-	"--cwd",
-	"--system-prompt",
-	"--append-system-prompt",
-	"--fork",
-	"--session-dir",
-	"--models",
-	"--tools",
-	"-t",
-	"--thinking",
-	"--extension",
-	"-e",
-	"--skill",
-	"--prompt-template",
-	"--theme",
-	"--autonomous-gate",
-	"--autonomous-gate-retries",
-	"--autonomous-gate-timeout-ms",
-	"--autonomous-max-continuations",
-	"--autonomous-max-turns",
-	"--autonomous-max-tokens",
-	"--autonomous-timeout-ms",
-	"--goal",
-	"--goal-token-budget",
-]);
-
-function findFirstEarlyLaunchPositional(args: readonly string[]): { index: number; value: string } | undefined {
-	for (let index = 0; index < args.length; index++) {
-		const arg = args[index]!;
-		if (arg === "--") {
-			return args[index + 1] === undefined ? undefined : { index: index + 1, value: args[index + 1]! };
-		}
-		if (EARLY_LAUNCH_VALUE_FLAGS.has(arg)) {
-			index++;
-			continue;
-		}
-		if (arg === "--resume" || arg === "-r") {
-			if (args[index + 1] && !args[index + 1]!.startsWith("-")) {
-				index++;
-			}
-			continue;
-		}
-		if (!arg.startsWith("-")) {
-			return { index, value: arg };
-		}
-	}
-	return undefined;
-}
 
 export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark: boolean): boolean {
 	if (startupBenchmark) {
@@ -547,15 +526,21 @@ export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark
 	if (args.includes("--print") || args.includes("-p")) {
 		return true;
 	}
-	const firstPositional = findFirstEarlyLaunchPositional(args);
-	const isHelpCommand =
-		firstPositional?.value === "help" && isHelpCommandRequest(args.slice(firstPositional.index + 1));
+	const firstPositional = findFirstPositionalArgument(args);
+	if (!firstPositional || !isCommandPositional(firstPositional)) {
+		return true;
+	}
+	// Prompt-run flags keep a following command word on the chat path (the
+	// rotation skips them), so these runs need the early daemon boot too.
+	if (args.slice(0, firstPositional.index).some((arg) => PROMPT_RUN_FLAGS.has(arg))) {
+		return true;
+	}
+	const helpPath =
+		firstPositional.value === "help" ? extractHelpCommandPath(args, firstPositional.index + 1) : undefined;
+	const isHelpCommand = helpPath !== undefined && isHelpCommandRequest(helpPath);
 	if (
-		firstPositional &&
-		(REMOVED_COMMAND_NAMES.has(firstPositional.value) ||
-			(PUBLIC_COMMAND_NAMES.has(firstPositional.value) &&
-				firstPositional.value !== "agents" &&
-				(firstPositional.value !== "help" || isHelpCommand)))
+		REMOVED_COMMAND_NAMES.has(firstPositional.value) ||
+		(firstPositional.value !== "agents" && (firstPositional.value !== "help" || isHelpCommand))
 	) {
 		return false;
 	}

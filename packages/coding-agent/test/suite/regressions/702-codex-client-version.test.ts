@@ -43,7 +43,8 @@ describe("issue #702 codex model discovery client version", () => {
 			}),
 		);
 
-		const registry = ModelRegistry.create(AuthStorage.create(authPath), join(tempDir, "models.json"));
+		const authStorage = AuthStorage.create(authPath);
+		const registry = ModelRegistry.create(authStorage, join(tempDir, "models.json"));
 		const codexModels = registry.getAvailable().filter((model) => model.provider === "openai-codex");
 		expect(codexModels.length).toBeGreaterThan(0);
 
@@ -66,8 +67,21 @@ describe("issue #702 codex model discovery client version", () => {
 		// once the lockstep package version reaches the pinned constant.
 		expect(clientVersion).toMatch(/^\d+\.\d+\.\d+$/);
 		const [major, minor] = (clientVersion ?? "0.0.0").split(".").map(Number);
-		expect((major ?? 0) > 0 || (minor ?? 0) >= 144).toBe(true);
+		// 0.153.x is the floor at which ChatGPT discovery lists GPT-6 Astra (discussion #2062).
+		expect((major ?? 0) > 0 || (minor ?? 0) >= 153).toBe(true);
 
 		expect(executable.some((model) => model.provider === "openai-codex")).toBe(true);
+		await registry.getExecutableModels();
+		expect(requestedUrls.filter((url) => url.includes("/codex/models"))).toHaveLength(1);
+
+		authStorage.set("openai-codex", {
+			type: "oauth",
+			access: `${codexAccessToken("account-123")}-rotated`,
+			refresh: "rotated-refresh-token",
+			expires: Date.now() + 60 * 60 * 1000,
+			accountId: "account-123",
+		});
+		await registry.getExecutableModels();
+		expect(requestedUrls.filter((url) => url.includes("/codex/models"))).toHaveLength(2);
 	});
 });

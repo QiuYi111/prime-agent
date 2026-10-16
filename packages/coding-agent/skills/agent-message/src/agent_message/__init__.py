@@ -1,23 +1,17 @@
 """Prime Agent session-to-session messaging skill.
 
 All routing and sender identity live in the TypeScript daemon. These functions
-only call the host bridge exposed inside the Prime Agent IPython kernel.
+only call the host bridge exposed inside the Prime Agent kernel.
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from IPython.display import display
 from rlm import host_request
 
 ReceiverRole = Literal["parent", "sibling", "child"]
 _MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
-
-
-async def list_agents() -> dict[str, Any]:
-    """List this agent's parent, siblings, and children, including inactive family."""
-    return await host_request("agent_message.list_agents")
 
 
 async def send(
@@ -69,6 +63,8 @@ async def send(
 
 def _emit_sent_message(receipt: dict[str, Any], receiver_role: str | None = None) -> None:
     try:
+        from rlm import emit
+
         label = (
             "Agent message queued"
             if receipt.get("deliveryStatus") == "queued"
@@ -77,12 +73,11 @@ def _emit_sent_message(receipt: dict[str, Any], receiver_role: str | None = None
         display_receipt = dict(receipt)
         if receiver_role in ("parent", "sibling", "child"):
             display_receipt["receiverRole"] = receiver_role
-        display(
+        emit(
             {
                 _MESSAGE_DISPLAY_MIME: display_receipt,
                 "text/plain": label,
-            },
-            raw=True,
+            }
         )
     except Exception:
         pass

@@ -4,16 +4,20 @@ The state model is intentionally small: it records prompt notes, memory,
 skills, subagent specs, and refinement events in the session-local harness
 store by default; pass ``global_=True`` for the cross-session global store.
 Execution still belongs to Prime Agent's TypeScript host and the existing
-``rlm.run`` recursion bridge.
+``rlm.spawn`` recursion bridge.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import stat
+import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, Literal
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
@@ -33,6 +37,76 @@ def _slug(raw: str, fallback: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
     normalized = "_".join(part for part in normalized.split("_") if part)
     return (normalized or fallback)[:80]
+
+
+_CJK_TERM_CHARS = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+    r"\U00020000-\U0002a6df\U0002a700-\U0002b73f\U0002b740-\U0002b81f"
+    r"\U0002b820-\U0002ceaf\U0002ceb0-\U0002ebef\U0002ebf0-\U0002ee5f"
+    r"\U0002f800-\U0002fa1f\U00030000-\U0003134f\U00031350-\U000323af"
+    r"\U000323b0-\U0003347f]"
+)
+
+
+def _harness_query_runs(text: str) -> list[str]:
+    """Split lowercase text into word runs.
+
+    Letters, digits, and combining marks of any script share a run;
+    punctuation and symbols end it. Runs break only at CJK boundaries:
+    accented Latin stays whole (naïve) while spacing-free CJK is cut
+    apart from adjacent words it would otherwise swallow (修复login).
+    """
+    runs: list[str] = []
+    run: list[str] = []
+    run_is_cjk = False
+    for ch in text:
+        if unicodedata.category(ch).startswith("M") or ch.isalnum():
+            ch_is_cjk = bool(_CJK_TERM_CHARS.match(ch))
+            if run and ch_is_cjk != run_is_cjk:
+                runs.append("".join(run))
+                run = []
+            run_is_cjk = ch_is_cjk
+            run.append(ch)
+        elif run:
+            runs.append("".join(run))
+            run = []
+    if run:
+        runs.append("".join(run))
+    return runs
+
+
+def _harness_query_terms(query: str) -> list[str]:
+    """Tokenize a search query into lowercase substring terms.
+
+    Letters and digits of every script form terms; punctuation and symbols
+    only separate them, so ``worktree?`` never ranks entries by question
+    marks. CJK runs carry no spaces between words, so each run becomes
+    overlapping bigrams: ``修复登录`` yields ``修复``/``复登``/``登录`` and
+    still matches an entry containing ``登录故障``. Each term counts once.
+    Minimum lengths stay below the digest builder's four-character cut
+    because ``search`` tokenizes explicit queries, not mined conversation:
+    three ASCII characters keep real terms (rlm, api, cli), two characters
+    keep short words of other scripts (мир), and single characters are
+    terms only for CJK, where one character is a word.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for run in _harness_query_runs(query.lower()):
+        if _CJK_TERM_CHARS.search(run):
+            # Bigrams keep whitespace-free CJK findable without single
+            # characters matching too loosely.
+            candidates = [run[i : i + 2] for i in range(len(run) - 1)] or [run]
+        elif run.isascii():
+            candidates = [run] if len(run) >= 3 else []
+        else:
+            # Other scripts space out words: lone characters match too
+            # broadly, so two characters is the floor.
+            candidates = [run] if len(run) >= 2 else []
+        for term in candidates:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return terms
 
 
 def _agent_dir() -> Path:
@@ -295,8 +369,24 @@ class HarnessState:
             },
             "refinements": [asdict(event) for event in self.refinements],
         }
-        with self.file_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # Atomic replace on the real file: aliases survive, readers never see a torn file.
+        target_path = Path(os.path.realpath(self.file_path))
+        temp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+        except FileNotFoundError:
+            existing_mode = None
+        mode = existing_mode if existing_mode is not None else 0o600
+        try:
+            # Create no looser than the destination; retain the umask for new files.
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            if existing_mode is not None:
+                os.chmod(temp_path, existing_mode)
+            os.replace(temp_path, target_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
         self._loaded_mtime = self._disk_mtime()
         return self
 
@@ -728,7 +818,7 @@ class HarnessState:
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
             "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
             "Spawn a subagent spec by composing a concise task prompt and calling "
-            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "handle = await rlm.spawn('sub-task', name='worker'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
@@ -767,6 +857,53 @@ class HarnessState:
         else:
             lines.append("refinements: 0")
         return "\n".join(lines)
+
+    def search(
+        self,
+        query: str,
+        kind: HarnessKind | None = None,
+        limit: int = 10,
+        *,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> list[HarnessEntry]:
+        """Return harness entries ranked by weighted term overlap with *query*.
+
+        Terms are scored against an entry's title, content, path, and id;
+        matches in more distinct fields count more.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.search(query, kind=kind, limit=limit)
+        self._sync_from_disk()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise TypeError("limit must be a positive int")
+        terms = _harness_query_terms(query)
+        if not terms:
+            return []
+
+        def score(entry: HarnessEntry) -> float:
+            title = entry.title.lower()
+            content = entry.content.lower()
+            path_and_id = f"{entry.path} {entry.id}".lower()
+            total = 0.0
+            for term in terms:
+                fields = (1 if term in title else 0) + (1 if term in content else 0) + (
+                    1 if term in path_and_id else 0
+                )
+                if fields:
+                    total += 1 + (fields - 1) * 0.5
+            return total
+
+        entries = self.list(kind, **kwargs) if kind is not None else self.list(None, **kwargs)
+
+        def recency(entry: HarnessEntry) -> str:
+            return entry.updated_at if isinstance(entry.updated_at, str) else ""
+
+        ranked = sorted(entries, key=lambda e: (score(e), recency(e)), reverse=True)
+        ranked = [e for e in ranked if score(e) > 0]
+        return ranked[:limit]
 
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):

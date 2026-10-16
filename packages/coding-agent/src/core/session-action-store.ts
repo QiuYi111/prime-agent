@@ -7,6 +7,12 @@ import type { SessionSlashCommand } from "./slash-commands.js";
 export type DeliveryPolicy = "next_turn_boundary" | "when_run_idle";
 export type WakePolicy = "immediate" | "on_lower_boundary" | "external_resume";
 
+/** Queue order inside a delivery lane: human input outranks agent-to-agent and other machine traffic. */
+export type SessionActionPriority = "pinned" | "user" | "background";
+export type SessionActionPlacement = "priority" | "tail" | "front";
+
+const PRIORITY_RANK: Record<SessionActionPriority, number> = { pinned: 2, user: 1, background: 0 };
+
 export type QueuedMessageLane = "steering" | "followUp";
 
 export function queuedMessageLaneDeliveryPolicy(lane: QueuedMessageLane): DeliveryPolicy {
@@ -68,6 +74,7 @@ export interface SessionAction<TPayload extends SessionActionPayload = SessionAc
 	id: string;
 	source: InputSource | "internal";
 	delivery: DeliveryPolicy;
+	priority: SessionActionPriority;
 	wake: WakePolicy;
 	payload: TPayload;
 	lifecycle: ActionLifecycle;
@@ -210,17 +217,10 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 	private readonly whenRunIdle: TAction[] = [];
 	private readonly tickets = new Map<string, ActionTicketController>();
 
-	enqueue(action: TAction): void {
-		this.assertNewAction(action);
-		this.list(action.delivery).push(action);
-		this.tickets.set(action.id, new ActionTicketController(action.id));
-	}
-
-	enqueueFront(action: TAction): void {
+	enqueue(action: TAction, placement: SessionActionPlacement = "priority"): void {
 		this.assertNewAction(action);
 		const list = this.list(action.delivery);
-		const firstQueued = list.findIndex((item) => item.lifecycle.state === "queued");
-		list.splice(firstQueued < 0 ? list.length : firstQueued, 0, action);
+		list.splice(this.insertionIndex(list, action, placement), 0, action);
 		this.tickets.set(action.id, new ActionTicketController(action.id));
 	}
 
@@ -319,6 +319,26 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		this.tickets.delete(action.id);
 	}
 
+	/**
+	 * Queued actions are ordered by priority and stay FIFO within a priority. Actions that are
+	 * no longer queued are already committed to this turn, so nothing is inserted ahead of them.
+	 */
+	private insertionIndex(list: readonly TAction[], action: TAction, placement: SessionActionPlacement): number {
+		if (placement === "tail") return list.length;
+		if (placement === "front") {
+			const firstQueued = list.findIndex((item) => item.lifecycle.state === "queued");
+			return firstQueued < 0 ? list.length : firstQueued;
+		}
+		const rank = PRIORITY_RANK[action.priority];
+		let index = list.length;
+		for (let position = list.length - 1; position >= 0; position--) {
+			const item = list[position];
+			if (!item || item.lifecycle.state !== "queued" || PRIORITY_RANK[item.priority] >= rank) break;
+			index = position;
+		}
+		return index;
+	}
+
 	private actions(policy?: DeliveryPolicy): readonly TAction[] {
 		if (policy) return this.list(policy);
 		return [...this.nextTurnBoundary, ...this.whenRunIdle];
@@ -350,7 +370,6 @@ export type IdleEvictionMinutes = number | "off";
 export interface SessionEvictionSnapshot {
 	isSessionActive: boolean;
 	attachedClients: number;
-	hasRegisteredHeartbeat: boolean;
 	hasRegisteredCronJob: boolean;
 	lastActivityAt: number;
 }
@@ -367,6 +386,7 @@ export interface WorkerEvictionSnapshot {
 	isStopping: boolean;
 	hasOwnerClient: boolean;
 	isPreparingUpdateRestart: boolean;
+	hasWakeBlindSchedule: boolean;
 	sessions: readonly SessionEvictionSnapshot[];
 }
 
@@ -381,7 +401,6 @@ function isIdleEvictionThresholdMet(
 	return (
 		!session.isSessionActive &&
 		session.attachedClients === 0 &&
-		!session.hasRegisteredHeartbeat &&
 		!session.hasRegisteredCronJob &&
 		Number.isFinite(session.lastActivityAt) &&
 		now - session.lastActivityAt >= idleEvictionMinutes * 60_000
@@ -414,6 +433,7 @@ export function canEvictWorker(
 		worker.isStopping ||
 		worker.hasOwnerClient ||
 		worker.isPreparingUpdateRestart ||
+		worker.hasWakeBlindSchedule ||
 		worker.sessions.length === 0
 	) {
 		return false;

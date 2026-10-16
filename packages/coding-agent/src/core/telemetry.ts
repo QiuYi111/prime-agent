@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { detectInstallMethod, VERSION } from "../config.js";
+import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.js";
 import type { AgentExecutionMode } from "./agent-session-config.js";
 import type { AuthCredential, AuthStatus } from "./auth-storage.js";
+import { platformFidelity } from "./platform-fidelity.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { isBuiltinSlashCommandName, resolveBuiltinSlashCommandName } from "./slash-commands.js";
 
@@ -212,9 +214,6 @@ export function isTelemetryEnabled(settingsManager: SettingsManager): boolean {
 	if (override !== undefined) {
 		return override;
 	}
-	if (process.env.NODE_ENV === "test") {
-		return false;
-	}
 	return settingsManager.getTelemetryEnabled();
 }
 
@@ -237,21 +236,7 @@ function readInstallationId(path: string): string | undefined {
 }
 
 function writeTelemetryStateAtomically(path: string, state: TelemetryState): void {
-	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	try {
-		writeFileSync(temporaryPath, JSON.stringify(state, null, 2), {
-			encoding: "utf8",
-			flag: "wx",
-			mode: 0o600,
-		});
-		renameSync(temporaryPath, path);
-	} finally {
-		try {
-			unlinkSync(temporaryPath);
-		} catch {
-			// The rename succeeded or the temporary file was never created.
-		}
-	}
+	writeFileAtomicSync(path, JSON.stringify(state, null, 2), { mode: 0o600 });
 }
 
 export function getOrCreateTelemetryInstallationId(agentDir: string, randomId: () => string = randomUUID): string {
@@ -491,12 +476,18 @@ export function telemetryAuthCategory(
 }
 
 function baseProperties(executionMode: TelemetryExecutionMode): TelemetryProperties {
+	const fidelity = platformFidelity();
 	return {
 		version: VERSION,
 		os_family: platform(),
 		architecture: arch(),
 		install_method: detectInstallMethod(),
 		execution_mode: executionMode,
+		libc: fidelity.libc,
+		libc_version: fidelity.libc_version,
+		cpu_baseline: fidelity.cpu_baseline,
+		os_release: fidelity.os_release,
+		os_product_version: fidelity.os_product_version,
 	};
 }
 

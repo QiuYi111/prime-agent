@@ -1,4 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, it, type Mock, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
@@ -44,7 +45,9 @@ type PromptStashHarness = {
 };
 
 type PromptStashLiveMarkerHarness = PromptStashHarness & {
-	connectionQueue: { steering: string[]; followUp: string[] };
+	connectionState: {
+		sessionActions: { queuedCount: number; steering: readonly string[]; followUps: readonly string[] };
+	};
 };
 
 type SharedPromptStashHarness = PromptStashHarness & {
@@ -71,7 +74,7 @@ type ResetHarness = PromptStashLiveMarkerHarness & {
 	activityTracker: { reset: Mock };
 	contextUsageTokenBaseline: number;
 	agentRunFileChanges: Map<string, unknown>;
-	recapContainer: { clear: Mock };
+	recapContainer: Container;
 	ui: { requestRender: Mock };
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown>;
@@ -628,13 +631,13 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.getText()).toBe("half-written draft");
 	});
 
-	it("drops queued image references from old sessions while keeping stashed images", () => {
+	it("drops old-session images while keeping stashed images", () => {
 		const base = createPromptStashHarness({ stash: "keep [image #1]" });
 		const mode: ResetHarness = {
 			...base,
 			defaultEditor: base.editor,
 			queueSelection: new QueueSelection(),
-			connectionQueue: { steering: ["old [image #2]"], followUp: [] },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
 			chatContainer: { clear: vi.fn() },
 			shortcutGuideContainer: { clear: vi.fn() },
 			pendingMessagesContainer: { clear: vi.fn() },
@@ -647,7 +650,7 @@ describe("InteractiveMode prompt stash", () => {
 			activityTracker: { reset: vi.fn() },
 			contextUsageTokenBaseline: 1,
 			agentRunFileChanges: new Map(),
-			recapContainer: { clear: vi.fn() },
+			recapContainer: new Container(),
 			ui: { requestRender: vi.fn() },
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
@@ -661,7 +664,6 @@ describe("InteractiveMode prompt stash", () => {
 
 		interactiveModeMethods.resetCurrentSessionRenderState.call(mode);
 
-		expect(mode.connectionQueue).toEqual({ steering: [], followUp: [] });
 		expect(mode.promptStash?.text).toBe("keep [image #1]");
 		expect(mode.pastedImages.has(1)).toBe(true);
 		expect(mode.pastedImages.has(2)).toBe(false);
@@ -673,7 +675,7 @@ describe("InteractiveMode prompt stash", () => {
 			...base,
 			defaultEditor: base.editor,
 			queueSelection: new QueueSelection(),
-			connectionQueue: { steering: [], followUp: [] },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
 			chatContainer: { clear: vi.fn() },
 			shortcutGuideContainer: { clear: vi.fn() },
 			pendingMessagesContainer: { clear: vi.fn() },
@@ -683,7 +685,7 @@ describe("InteractiveMode prompt stash", () => {
 			activityTracker: { reset: vi.fn() },
 			contextUsageTokenBaseline: 1,
 			agentRunFileChanges: new Map(),
-			recapContainer: { clear: vi.fn() },
+			recapContainer: new Container(),
 			ui: { requestRender: vi.fn() },
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
@@ -818,7 +820,7 @@ describe("InteractiveMode prompt stash", () => {
 	it("keeps image markers in a stashed prompt live", () => {
 		const mode: PromptStashLiveMarkerHarness = {
 			...createPromptStashHarness({ stash: "look at [image #7]" }),
-			connectionQueue: { steering: [], followUp: [] },
+			connectionState: { sessionActions: { queuedCount: 0, steering: [], followUps: [] } },
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 

@@ -18,12 +18,31 @@ describe("ExtensionSelectorComponent", () => {
 		initTheme("dark");
 	});
 
+	it("renders every line of a multiline prompt in inline mode", () => {
+		const selector = new ExtensionSelectorComponent(
+			"Choose an account\nSign in with the account you want to use with Prime Agent.",
+			["Personal", "Business"],
+			vi.fn(),
+			vi.fn(),
+			{ getRows: () => 24, inline: true },
+		);
+
+		const output = stripAnsi(selector.render(88).join("\n"));
+		const lines = output.split("\n");
+		const titleIndex = lines.findIndex((line) => line.includes("Choose an account"));
+
+		expect(titleIndex).toBe(0);
+		expect(lines[titleIndex + 1]).toContain("Sign in with the account you want to use with Prime Agent.");
+		expect(output).toContain("Personal");
+		expect(output).toContain("Business");
+	});
+
 	it("renders a multiline prompt with compact option rows", () => {
 		const selector = new ExtensionSelectorComponent(
 			[
-				"Interrupted IPython cell is still running",
+				"Interrupted Python cell is still running",
 				"Ctrl+C sent an interrupt, but the previous cell has not stopped yet.",
-				"Waiting preserves the current kernel state. Killing restarts IPython and loses in-memory variables.",
+				"Waiting preserves the current kernel state. Killing restarts the kernel and loses in-memory variables.",
 			].join("\n"),
 			["Wait and preserve state", "Kill kernel and restart"],
 			vi.fn(),
@@ -37,14 +56,14 @@ describe("ExtensionSelectorComponent", () => {
 		const waitIndex = outputLines.findIndex((line) => line.includes("Wait and preserve state"));
 		const killIndex = outputLines.findIndex((line) => line.includes("Kill kernel and restart"));
 
-		expect(output).toContain("Interrupted IPython cell is still running");
+		expect(output).toContain("Interrupted Python cell is still running");
 		expect(output).toContain("Ctrl+C sent an interrupt");
 		expect(output).toContain("Waiting preserves the current kernel state");
 		expect(waitIndex).toBeGreaterThan(-1);
 		expect(killIndex).toBe(waitIndex + 1);
 		expectTrailingBackground(
-			lines.find((line) => line.includes("Interrupted IPython cell is still running")),
-			"Interrupted IPython cell is still running",
+			lines.find((line) => line.includes("Interrupted Python cell is still running")),
+			"Interrupted Python cell is still running",
 		);
 		expectTrailingBackground(lines[waitIndex], "Wait and preserve state");
 		expectTrailingBackground(lines[killIndex], "Kill kernel and restart");

@@ -127,12 +127,109 @@ class HarnessStateTest(unittest.TestCase):
                 reloaded.overview(),
             )
             overview = reloaded.overview()
-            self.assertIn("handle = await rlm('sub-task')", overview)
+            self.assertIn("handle = await rlm.spawn('sub-task', name='worker')", overview)
             self.assertIn("never the child's answer", overview)
             self.assertIn("receiver_role='parent'", overview)
             self.assertIn("await rlm.list_subagents()", overview)
             self.assertIn("receiver_role='child'", overview)
             self.assertIn("refinements: 1", reloaded.overview())
+
+    def test_save_failure_preserves_previous_state_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Durable fact", "Written before the crash.")
+
+            crashing = HarnessState(state.file_path)
+            original_dump = json.dump
+
+            def torn_dump(data: object, fh: object, **kwargs: object) -> None:
+                fh.write('{"schema": 1, "entr')  # type: ignore[attr-defined]
+                raise OSError("disk full")
+
+            json.dump = torn_dump  # type: ignore[assignment]
+            try:
+                with self.assertRaises(OSError):
+                    crashing.create_memory("Doomed fact", "Interrupted mid-write.")
+            finally:
+                json.dump = original_dump
+
+            # The interrupted save must not have truncated the durable state.
+            reloaded = HarnessState(state.file_path)
+            titles = [entry.title for entry in reloaded.entries["memory"].values()]
+            self.assertEqual(titles, ["Durable fact"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits and umask")
+    def test_save_preserves_existing_mode_despite_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("First", "Creates the file.")
+            os.chmod(state.file_path, 0o666)
+            previous_umask = os.umask(0o022)
+            try:
+                state.create_memory("Second", "Replaces the file.")
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(os.stat(state.file_path).st_mode & 0o777, 0o666)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits and umask")
+    def test_save_new_file_keeps_restrictive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            previous_umask = os.umask(0o777)
+            try:
+                state.create_memory("First", "Creates the file.")
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(os.stat(state.file_path).st_mode & 0o777, 0)
+
+    def test_save_preserves_restrictive_file_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("First", "Creates the file.")
+            os.chmod(state.file_path, 0o600)
+
+            state.create_memory("Second", "Replaces the file.")
+
+            self.assertEqual(os.stat(state.file_path).st_mode & 0o777, 0o600)
+
+    def test_save_temp_file_is_never_looser_than_the_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("First", "Creates the file.")
+            os.chmod(state.file_path, 0o600)
+
+            observed_modes: list[int] = []
+            original_open = os.open
+
+            def observing_open(path: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+                if str(path).endswith(".tmp"):
+                    observed_modes.append(mode)
+                return original_open(path, flags, mode, **kwargs)
+
+            os.open = observing_open  # type: ignore[assignment]
+            try:
+                state.create_memory("Second", "Replaces the file.")
+            finally:
+                os.open = original_open
+
+            self.assertEqual(observed_modes, [0o600])
+            self.assertEqual(os.stat(state.file_path).st_mode & 0o777, 0o600)
+
+    def test_save_writes_through_a_symlinked_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            real_path = Path(temp_dir) / "real_state.json"
+            alias = Path(temp_dir) / "harness_state.json"
+            HarnessState(real_path).create_memory("Seed", "Creates the real file.")
+            alias.symlink_to(real_path)
+
+            state = HarnessState(alias)
+            state.create_memory("Through alias", "Must land in the real file.")
+
+            self.assertTrue(alias.is_symlink())
+            titles = [entry.title for entry in HarnessState(real_path).entries["memory"].values()]
+            self.assertEqual(titles, ["Seed", "Through alias"])
 
     def test_load_ignores_unknown_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -933,3 +1030,108 @@ class HarnessStateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HarnessSearchTest(unittest.TestCase):
+    def test_search_ranks_relevant_entries_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Tea notes", "All about oolong brewing.", id="tea")
+            state.create_memory("Worktree policy", "Use git worktrees for parallel branches.", id="worktree")
+            state.create_prompt_note("RSI program", "Ship [RSI] PRs from worktrees.", id="rsi")
+
+            results = state.search("worktree branches")
+
+            self.assertTrue(results)
+            self.assertEqual(results[0].id, "worktree")
+            self.assertTrue(all(entry.id != "tea" for entry in results))
+
+    def test_search_filters_by_kind_and_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Worktree memory", "worktree workflow", id="m1")
+            state.create_prompt_note("Worktree prompt", "worktree workflow", id="p1")
+            state.create_prompt_note("Worktree prompt 2", "worktree workflow", id="p2")
+
+            prompts = state.search("worktree", kind="prompt")
+            self.assertTrue(prompts)
+            self.assertEqual({entry.kind for entry in prompts}, {"prompt"})
+
+            limited = state.search("worktree", kind="prompt", limit=1)
+            self.assertEqual(len(limited), 1)
+
+    def test_search_matches_non_ascii_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Tokyo note", "東京ミーティングの議事録。", id="tokyo")
+
+            results = state.search("東京")
+            self.assertEqual([entry.id for entry in results], ["tokyo"])
+
+    def test_search_segments_whitespace_free_cjk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Login fix", "登录故障排查记录。", id="login")
+            state.create_memory("Tea notes", "All about oolong brewing.", id="tea")
+
+            results = state.search("修复登录")
+
+            self.assertEqual([entry.id for entry in results], ["login"])
+
+    def test_search_matches_supplementary_cjk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Ext B note", "𠀀𠀁 ideographs recorded.", id="extb")
+
+            self.assertEqual([entry.id for entry in state.search("𠀀")], ["extb"])
+            self.assertEqual([entry.id for entry in state.search("𠀀𠀁")], ["extb"])
+
+    def test_search_keeps_accented_latin_words_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Review notes", "The naïve approach failed.", id="naive")
+
+            results = state.search("naïve")
+
+            self.assertEqual([entry.id for entry in results], ["naive"])
+
+    def test_search_matches_combining_mark_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Book note", "किताब पढ़ रहा हूँ।", id="book")
+
+            results = state.search("किताब")
+
+            self.assertEqual([entry.id for entry in results], ["book"])
+
+    def test_search_drops_single_character_non_cjk_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Russian note", "мир и согласие в команде.", id="mir")
+
+            self.assertEqual(state.search("и"), [])
+            self.assertEqual([entry.id for entry in state.search("мир")], ["mir"])
+
+    def test_search_treats_punctuation_as_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Branch hygiene", "Use git worktrees for parallel branches.", id="worktree")
+            state.create_memory("Question", "Anything else left open?", id="question")
+
+            results = state.search("worktree?")
+            self.assertEqual([entry.id for entry in results], ["worktree"])
+
+            self.assertEqual(state.search("??? / . ,"), [])
+
+    def test_search_drops_zero_score_entries_and_validates_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Tea notes", "All about oolong brewing.", id="tea")
+
+            self.assertEqual(state.search("quantum"), [])
+            self.assertEqual(state.search("   "), [])
+            with self.assertRaises(TypeError):
+                state.search(42)
+            with self.assertRaises(TypeError):
+                state.search("worktree", limit=0)
+

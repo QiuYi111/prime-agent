@@ -29,7 +29,15 @@ import {
 	saveHarnessState,
 } from "../../src/core/refinement/index.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
-import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import type { BashOperations } from "../../src/core/tools/bash.js";
+import {
+	conversationMessages,
+	createHarness,
+	getAssistantTexts,
+	getMessageText,
+	getUserTexts,
+	type Harness,
+} from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
 type AutoRefineReason = "turn_interval" | "compact";
@@ -39,7 +47,7 @@ type AutoRefineInternals = {
 	_scheduleAutoRefine(reason: AutoRefineReason): void;
 	_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
 	_scheduleAutoRefineAfterAgentEnd(): void;
-	_schedulePostCompactionContinue(): void;
+	_schedulePostCompactionContinue(continueAfterSessionInput?: boolean): void;
 	_invalidatePendingAutoRefineForBranchChange(): Promise<void>;
 	_cancelPostCompactionContinue(): void;
 	_assistantTurnsSinceAutoRefine: number;
@@ -327,34 +335,71 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("retries a scheduled post-compaction continuation when another run starts first", async () => {
-		vi.useFakeTimers();
+	it("waits for the active run to settle before retrying a post-compaction continuation", async () => {
 		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
+		const activeRunSettled = createDeferred();
 		const continueAgent = vi
 			.spyOn(harness.session.agent, "continue")
 			.mockRejectedValueOnce(
 				new AgentContinueError("busy", "Agent is already processing. Wait for completion before continuing."),
 			)
 			.mockResolvedValueOnce();
+		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(() =>
+			continueAgent.mock.calls.length === 0 ? Promise.resolve() : activeRunSettled.promise,
+		);
 
-		try {
-			internals._schedulePostCompactionContinue();
-			await vi.advanceTimersByTimeAsync(100);
+		internals._schedulePostCompactionContinue();
+		await vi.waitFor(() => expect(continueAgent).toHaveBeenCalledTimes(1));
+		expect(internals._postCompactionContinuationScheduled).toBe(true);
 
-			expect(continueAgent).toHaveBeenCalledTimes(1);
-			expect(internals._postCompactionContinuationScheduled).toBe(true);
+		activeRunSettled.resolve();
+		await vi.waitFor(() => expect(continueAgent).toHaveBeenCalledTimes(2));
+		expect(internals._postCompactionContinuationScheduled).toBe(false);
+	});
 
-			await vi.advanceTimersByTimeAsync(100);
+	it("does not let a failed cancelled continuation reject its replacement", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const cancelledRun = createDeferred();
+		const replacementRun = createDeferred();
+		const continueAgent = vi
+			.spyOn(harness.session.agent, "continue")
+			.mockReturnValueOnce(cancelledRun.promise)
+			.mockReturnValueOnce(replacementRun.promise);
 
-			expect(continueAgent).toHaveBeenCalledTimes(2);
-			expect(internals._postCompactionContinuationScheduled).toBe(false);
-		} finally {
-			vi.useRealTimers();
-		}
+		internals._schedulePostCompactionContinue();
+		await vi.waitFor(() => expect(continueAgent).toHaveBeenCalledTimes(1));
+		internals._cancelPostCompactionContinue();
+		internals._schedulePostCompactionContinue();
+		await vi.waitFor(() => expect(continueAgent).toHaveBeenCalledTimes(2));
+		const idle = harness.session.waitForHeadlessIdle();
+
+		cancelledRun.reject(new Error("cancelled continuation failed"));
+		await new Promise<void>(setImmediate);
+		replacementRun.resolve();
+
+		await expect(idle).resolves.toBeUndefined();
+	});
+
+	it("waits for a queued-work pause to release before post-compaction continuation", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const pause = harness.session.acquireQueuedWorkPause();
+		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+
+		internals._schedulePostCompactionContinue();
+		await new Promise<void>(setImmediate);
+		expect(continueAgent).not.toHaveBeenCalled();
+
+		pause.release();
+		await harness.session.waitForHeadlessIdle();
+		expect(continueAgent).toHaveBeenCalledTimes(1);
 	});
 
 	it("cancels scheduled post-compaction continuation on branch changes", async () => {
@@ -407,24 +452,22 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
-		vi.useFakeTimers();
 		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
-		try {
-			internals._schedulePostCompactionContinue();
+		const idle = createDeferred();
+		vi.spyOn(harness.session.agent, "waitForIdle").mockReturnValue(idle.promise);
+		internals._schedulePostCompactionContinue();
 
-			await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
-				"Session is too short to compact",
-			);
+		await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
+			"Session is too short to compact",
+		);
 
-			expect(internals._postCompactionContinuationScheduled).toBe(true);
-		} finally {
-			internals._cancelPostCompactionContinue();
-			vi.useRealTimers();
-		}
+		expect(internals._postCompactionContinuationScheduled).toBe(true);
+		internals._cancelPostCompactionContinue();
+		idle.resolve();
 	});
 
 	it("auto-refine pending review uses the in-progress guard and catches refine failures", async () => {
@@ -1380,7 +1423,7 @@ describe("AgentSession queue characterization", () => {
 		await completion;
 		await expect(harness.session.promptAndWait("/fail")).rejects.toThrow("extension exploded");
 		expect(extensionErrors).toEqual(["extension exploded"]);
-		expect(harness.session.messages).toEqual([]);
+		expect(conversationMessages(harness.session)).toEqual([]);
 	});
 
 	it("settles a visibly queued session command while an earlier action is preparing", async () => {
@@ -1872,7 +1915,8 @@ describe("AgentSession queue characterization", () => {
 			{ deliverAs: "nextTurn" },
 		);
 		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
-		await harness.session.followUp("surviving");
+		// Both inputs stay in one priority class so the agent message keeps the batch anchor.
+		await harness.session.followUp("surviving", undefined, { priority: "background" });
 		pause.release();
 		await harness.session.waitForIdle();
 
@@ -1914,7 +1958,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.prompt("normal prompt");
 
 		expect(sawCustomMessage).toBe(true);
-		expect(harness.session.messages.map((message) => message.role)).toEqual([
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual([
 			"user",
 			"assistant",
 			"custom",
@@ -1995,9 +2039,10 @@ describe("AgentSession queue characterization", () => {
 		gatePreparation = false;
 		expect(pause).toBeDefined();
 
+		// The prompt without an agent message id is human input, so it queues ahead.
 		expect(harness.session.clearQueue()).toEqual({
 			steering: [],
-			followUp: ["clear first while preparing", "clear second while preparing"],
+			followUp: ["clear second while preparing", "clear first while preparing"],
 		});
 		pause?.release();
 		await firstCompletionRejection;
@@ -2302,7 +2347,9 @@ describe("AgentSession queue characterization", () => {
 		]);
 
 		expect(
-			harness.session.messages.filter((message) => message.role === "custom").map((message) => message.content),
+			conversationMessages(harness.session)
+				.filter((message) => message.role === "custom")
+				.map((message) => message.content),
 		).toEqual(["first", "second"]);
 	});
 
@@ -3310,7 +3357,11 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.followUp("ordinary");
 		await harness.session.queueAgentMessagePrompt(removedAgentMessage, "followUp", undefined);
 		await harness.session.queueAgentMessagePrompt(keptAgentMessage, "followUp", undefined);
-		await harness.session.followUp("last anchor", undefined, { queueKey: "heartbeat:one" });
+		await harness.session.followUp("last anchor", undefined, {
+			queueKey: "heartbeat:one",
+			// A heartbeat follow-up is machine input, so it queues behind the agent messages.
+			priority: "background",
+		});
 		expect(prepared).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
 
@@ -3586,5 +3637,51 @@ describe("AgentSession scheduler scenarios", () => {
 				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
 			}
 		}
+	});
+
+	it("waitForIdle parks instead of microtask-spinning while a running bash blocks queued input", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const session = harness.session;
+		let releaseBash!: () => void;
+		const gate = new Promise<{ exitCode: number | null }>((resolve) => {
+			releaseBash = () => resolve({ exitCode: 0 });
+		});
+		const operations: BashOperations = { exec: async () => await gate };
+		const bashPromise = session.executeBash("blocked", undefined, { operations });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(session.isBashRunning).toBe(true);
+
+		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
+		const firstPrompt = session.prompt("queued while bash runs");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Count pump scheduling from the idle wait. Unfixed, the wait loop respun the
+		// blocked pump purely in microtasks, so the setImmediate below never fired and
+		// only the 200th reschedule (the escape hatch) released the gate.
+		const internals = session as unknown as { _scheduleSessionInputPump(): void };
+		const originalSchedule = internals._scheduleSessionInputPump.bind(session);
+		let scheduleCount = 0;
+		let secondPrompt: Promise<void> | undefined;
+		internals._scheduleSessionInputPump = () => {
+			scheduleCount++;
+			if (scheduleCount === 200) releaseBash();
+			originalSchedule();
+		};
+
+		const idle = session.waitForIdle();
+		setImmediate(() => {
+			// An arrival during the park must not be lost once the busy state clears.
+			secondPrompt = session.prompt("queued during park");
+			secondPrompt.catch(() => undefined);
+			releaseBash();
+		});
+		await idle;
+		await bashPromise;
+		await firstPrompt;
+		await secondPrompt;
+
+		expect(scheduleCount).toBeLessThan(200);
+		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
 	});
 });

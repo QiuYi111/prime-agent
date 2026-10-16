@@ -13,8 +13,11 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
+import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -28,6 +31,11 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+}
+
+export interface SummarySlice {
+	summary: string;
+	usage?: Usage;
 }
 
 /**
@@ -88,6 +96,10 @@ function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | u
 	if (entry.type === "compaction") {
 		return undefined;
 	}
+	// Harness digests are regenerated on the new compaction head; never summarizer input.
+	if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+		return undefined;
+	}
 	return getMessageFromEntry(entry);
 }
 
@@ -98,6 +110,8 @@ export interface CompactionResult<T = unknown> {
 	tokensBefore: number;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+	/** What the summarization call(s) billed; persisted on the compaction entry. */
+	usage?: Usage;
 }
 export const COMPACT_SKILL_NAME = "compact";
 
@@ -384,6 +398,8 @@ export function findCutPoint(
 		const messageTokens = estimateTokens(entry.message);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
+			// No cut point at/after i (trailing tool results): keep only the final turn, not everything.
+			cutIndex = cutPoints[cutPoints.length - 1];
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
@@ -448,7 +464,7 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 const KERNEL_PERSIST_SUMMARY_NOTE =
-	"Note: the IPython kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
+	"Note: the Python kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
@@ -515,7 +531,9 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
-): Promise<string> {
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
+): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
 	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
@@ -538,13 +556,17 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+			? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers, sessionId };
 
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+				completionOptions,
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {
@@ -556,7 +578,7 @@ export async function generateSummary(
 		.map((c) => c.text)
 		.join("\n");
 
-	return textContent;
+	return { summary: textContent, usage: response.usage };
 }
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
@@ -670,6 +692,11 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
  */
+/** Runs one summary wire call; hosts decorate each call with its own request identity. */
+export type SummaryCallRunner = <T>(
+	call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+) => Promise<T>;
+
 export async function compact(
 	preparation: CompactionPreparation,
 	model: Model<any>,
@@ -678,6 +705,9 @@ export async function compact(
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	summaryCall: SummaryCallRunner = (call) => call(headers),
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -690,45 +720,62 @@ export async function compact(
 		settings,
 	} = preparation;
 	let summary: string;
+	const slices: SummarySlice[] = [];
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
+		// Split turns make two wire calls with different bodies; each needs its own identity.
 		const [historyResult, turnPrefixResult] = await Promise.all([
 			messagesToSummarize.length > 0
-				? generateSummary(
-						messagesToSummarize,
-						model,
-						settings.reserveTokens,
-						apiKey,
-						headers,
-						signal,
-						customInstructions,
-						previousSummary,
-						thinkingLevel,
+				? summaryCall((callHeaders) =>
+						generateSummary(
+							messagesToSummarize,
+							model,
+							settings.reserveTokens,
+							apiKey,
+							callHeaders,
+							signal,
+							customInstructions,
+							previousSummary,
+							thinkingLevel,
+							retry,
+							sessionId,
+						),
 					)
-				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(
-				turnPrefixMessages,
+				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
+			summaryCall((callHeaders) =>
+				generateTurnPrefixSummary(
+					turnPrefixMessages,
+					model,
+					settings.reserveTokens,
+					apiKey,
+					callHeaders,
+					signal,
+					thinkingLevel,
+					retry,
+					sessionId,
+				),
+			),
+		]);
+		slices.push(historyResult, turnPrefixResult);
+		summary = `${historyResult.summary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.summary}`;
+	} else {
+		const result = await summaryCall((callHeaders) =>
+			generateSummary(
+				messagesToSummarize,
 				model,
 				settings.reserveTokens,
 				apiKey,
-				headers,
+				callHeaders,
 				signal,
+				customInstructions,
+				previousSummary,
 				thinkingLevel,
+				retry,
+				sessionId,
 			),
-		]);
-		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
-	} else {
-		summary = await generateSummary(
-			messagesToSummarize,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			signal,
-			customInstructions,
-			previousSummary,
-			thinkingLevel,
 		);
+		slices.push(result);
+		summary = result.summary;
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
@@ -737,11 +784,18 @@ export async function compact(
 		throw new Error("First kept entry has no UUID - session may need migration");
 	}
 
+	let usage: Usage | undefined;
+	for (const slice of slices) {
+		if (!slice.usage) continue;
+		usage ??= emptyUsage();
+		addAssistantUsage(usage, slice.usage);
+	}
 	return {
 		summary,
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
+		usage,
 	};
 }
 
@@ -756,7 +810,9 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
-): Promise<string> {
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
+): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
@@ -769,20 +825,27 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+				model.reasoning && thinkingLevel && thinkingLevel !== "off"
+					? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
+					: { maxTokens, signal, apiKey, headers, sessionId },
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {
 		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
 	}
 
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+	return {
+		summary: response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n"),
+		usage: response.usage,
+	};
 }

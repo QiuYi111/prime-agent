@@ -2,7 +2,7 @@ import { lstatSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
@@ -236,7 +236,7 @@ describe("telemetry controls", () => {
 	it("honors settings and environment opt-outs", () => {
 		const settings = SettingsManager.inMemory({ telemetry: { enabled: true } });
 
-		vi.stubEnv("NODE_ENV", "production");
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		expect(isTelemetryEnabled(settings)).toBe(true);
 
 		vi.stubEnv("DO_NOT_TRACK", "1");
@@ -249,14 +249,6 @@ describe("telemetry controls", () => {
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		vi.stubEnv("PI_OFFLINE", "true");
 		expect(isTelemetryEnabled(settings)).toBe(false);
-	});
-
-	it("is disabled by default in tests unless explicitly enabled", () => {
-		const settings = SettingsManager.inMemory({ telemetry: { enabled: true } });
-		vi.stubEnv("NODE_ENV", "test");
-		expect(isTelemetryEnabled(settings)).toBe(false);
-		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
-		expect(isTelemetryEnabled(settings)).toBe(true);
 	});
 
 	it("normalizes malformed telemetry settings before updating them", async () => {
@@ -276,6 +268,10 @@ describe("telemetry controls", () => {
 });
 
 describe("agent telemetry aggregation", () => {
+	beforeEach(() => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
+	});
+
 	it("captures only allowlisted built-in command names", async () => {
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const sink = new FakeTelemetrySink();
@@ -330,6 +326,39 @@ describe("agent telemetry aggregation", () => {
 		});
 		expect(sink.flushCount).toBe(1);
 		expect(telemetryAuthCategory("models_json_command")).toBe("models_json");
+	});
+
+	it("includes platform fidelity properties on every event", async () => {
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
+		const sink = new FakeTelemetrySink();
+
+		await captureAgentCommandUsed({
+			agentDir: "/not-used",
+			settingsManager: SettingsManager.inMemory(),
+			commandName: "model",
+			sink,
+		});
+
+		const properties = sink.events[0]?.properties ?? {};
+		expect(properties.libc).toMatch(/^(glibc|musl|none|unknown)$/);
+		expect(properties.cpu_baseline).toMatch(/^(avx2|no_avx2|avx2_assumed|not_applicable|unknown)$/);
+		expect(typeof properties.libc_version).toBe("string");
+		expect(typeof properties.os_release).toBe("string");
+		expect(typeof properties.os_product_version).toBe("string");
+		// Non-identifying: no hostname, username, path, or hardware id fields.
+		expect(Object.keys(properties).sort()).toEqual([
+			"architecture",
+			"command_name",
+			"cpu_baseline",
+			"execution_mode",
+			"install_method",
+			"libc",
+			"libc_version",
+			"os_family",
+			"os_product_version",
+			"os_release",
+			"version",
+		]);
 	});
 
 	it("emits aggregate metrics without message or tool content", () => {

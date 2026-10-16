@@ -181,7 +181,7 @@ describe("buildSummarizationPrompt", () => {
 		expect(prompt).not.toContain("<user-instructions>");
 		expect(prompt).toContain("## Goal");
 		// The kernel keeps running across compaction — the note must not claim a wipe.
-		expect(prompt).toContain("IPython kernel keeps running");
+		expect(prompt).toContain("Python kernel keeps running");
 		expect(prompt).not.toMatch(/wiped|restarted/);
 	});
 
@@ -190,7 +190,7 @@ describe("buildSummarizationPrompt", () => {
 		expect(prompt).toContain("<user-instructions>");
 		expect(prompt).toContain("focus on the auth refactor, remember the migration command");
 		expect(prompt).toContain("</user-instructions>");
-		expect(prompt.indexOf("</user-instructions>")).toBeLessThan(prompt.indexOf("IPython kernel"));
+		expect(prompt.indexOf("</user-instructions>")).toBeLessThan(prompt.indexOf("Python kernel"));
 	});
 
 	it("uses the update template when a previous summary exists", () => {
@@ -322,6 +322,30 @@ describe("findCutPoint", () => {
 
 		const result = findCutPoint(entries, 0, entries.length, 50000);
 		expect(result.firstKeptEntryIndex).toBe(0);
+	});
+
+	it("keeps only the final turn when the budget is crossed inside trailing tool results", () => {
+		const hugeToolResult = {
+			role: "toolResult" as const,
+			toolCallId: "tc1",
+			toolName: "ipython",
+			content: [{ type: "text" as const, text: "x".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createAssistantMessage("A1", createMockUsage(0, 100, 1000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")), // index 2
+			createMessageEntry(createAssistantMessage("A2", createMockUsage(0, 100, 2000, 0))), // index 3: last cut point
+			createMessageEntry(hugeToolResult),
+			createMessageEntry(hugeToolResult),
+		];
+
+		// The budget is crossed inside the trailing tool results, past every cut
+		// point; the whole history must not be silently kept.
+		const result = findCutPoint(entries, 0, entries.length, 1000);
+		expect(result.firstKeptEntryIndex).toBe(3);
 	});
 
 	it("should indicate split turn when cutting at assistant message", () => {
