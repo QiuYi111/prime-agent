@@ -196,6 +196,26 @@ describe("trusted SDK provider broker", () => {
 		expect(hostReasoning).toBe("low");
 	});
 
+	it("caps aggregate output tokens across serial provider calls", async () => {
+		const observed: number[] = [];
+		const stream = (_model: any, _context: any, options: any): AssistantMessageEventStream => {
+			observed.push(options.maxTokens);
+			const result = createAssistantMessageEventStream();
+			const message: AssistantMessage = { role: "assistant", content: [], api: "broker-test-api", provider: "broker-test", model: "model-1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
+			result.push({ type: "start", partial: message }); result.push({ type: "done", reason: "stop", message }); return result;
+		};
+		registerApiProvider({ api: "broker-test-api", stream, streamSimple: stream });
+		root = await mkdtemp(join(tmpdir(), "pi-provider-broker-budget-"));
+		const socketPath = join(root, "provider.sock"), capability = "broker-capability-that-is-only-valid-for-this-test-123456", registry = modelRegistry();
+		broker = await startDelegatedProviderBroker({ socketPath, capability, modelRegistry: registry, allowedModels: [{ provider: "broker-test", api: "broker-test-api", id: "model-1" }], maxRequests: 3, maxOutputTokens: 8, maxTotalOutputTokens: 12 });
+		const adapter = createDelegatedProviderAdapter({ socketPath, capability }), model = registry.find("broker-test", "model-1")!;
+		for (let i = 0; i < 2; i++) for await (const _event of adapter.streamSimple(model, { messages: [] }, { maxTokens: 8 })) { }
+		const exhausted = adapter.streamSimple(model, { messages: [] }, { maxTokens: 8 });
+		for await (const _event of exhausted) { }
+		expect((await exhausted.result()).stopReason).toBe("error");
+		expect(observed).toEqual([8, 4]);
+	});
+
 	it("refreshes OAuth only in the host before dispatching the provider stream", async () => {
 		const provider = `broker-oauth-${randomUUID()}`;
 		let refreshCalls = 0;

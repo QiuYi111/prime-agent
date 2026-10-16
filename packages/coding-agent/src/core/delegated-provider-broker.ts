@@ -6,7 +6,9 @@ import { type Context, type Model, type SimpleStreamOptions, streamSimple } from
 import type { ModelRegistry } from "./model-registry.js";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
-const MAX_REQUESTS_PER_BROKER = 64;
+const MAX_REQUESTS_PER_BROKER = 8;
+const MAX_OUTPUT_TOKENS_PER_REQUEST = 512;
+const MAX_TOTAL_OUTPUT_TOKENS = 2048;
 
 export interface DelegatedProviderBrokerOptions {
 	socketPath: string;
@@ -15,6 +17,7 @@ export interface DelegatedProviderBrokerOptions {
 	allowedModels: Array<{ provider: string; api: string; id: string }>;
 	maxRequests?: number;
 	maxOutputTokens?: number;
+	maxTotalOutputTokens?: number;
 }
 
 interface StartFrame {
@@ -45,10 +48,12 @@ export async function startDelegatedProviderBroker(
 	options: DelegatedProviderBrokerOptions,
 ): Promise<{ close(): Promise<void> }> {
 	if (Buffer.byteLength(options.capability) < 32) throw new Error("Broker capability must contain at least 32 bytes");
-	const maxRequests = options.maxRequests ?? MAX_REQUESTS_PER_BROKER;
-	const maxOutputTokens = options.maxOutputTokens ?? 8192;
+	const maxRequests = Math.min(options.maxRequests ?? MAX_REQUESTS_PER_BROKER, MAX_REQUESTS_PER_BROKER);
+	const maxOutputTokens = Math.min(options.maxOutputTokens ?? MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_OUTPUT_TOKENS_PER_REQUEST);
+	let remainingOutputTokens = Math.min(options.maxTotalOutputTokens ?? MAX_TOTAL_OUTPUT_TOKENS, MAX_TOTAL_OUTPUT_TOKENS);
 	let requestCount = 0;
 	let connectionCount = 0;
+	let activeRequest = false;
 	const sockets = new Set<Socket>();
 	const allowed = new Set(options.allowedModels.map((model) => `${model.provider}\0${model.api}\0${model.id}`));
 	if (allowed.size === 0) throw new Error("Broker requires at least one allowed model");
@@ -83,36 +88,42 @@ export async function startDelegatedProviderBroker(
 			throw new Error("Invalid broker request");
 		if (!equalCapability(request.capability, options.capability)) throw new Error("Invalid broker capability");
 		if (++requestCount > maxRequests) throw new Error("Broker request limit reached");
-		const key = `${request.model?.provider}\0${request.model?.api}\0${request.model?.id}`;
-		if (!allowed.has(key)) throw new Error("Model is outside this run's broker capability");
-		if (!request.context || !Array.isArray(request.context.messages)) throw new Error("Invalid broker context");
-		const model = options.modelRegistry.find(request.model.provider, request.model.id) as Model<any> | undefined;
-		if (!model || model.api !== request.model.api) throw new Error("Requested model is unavailable");
-		const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? "Provider is not authenticated" : auth.error);
-		const maxTokens = Math.max(
-			1,
-			Math.min(
-				Number.isInteger(request.options?.maxTokens) ? request.options!.maxTokens! : maxOutputTokens,
+		if (activeRequest) throw new Error("Broker accepts only serial requests");
+		activeRequest = true;
+		try {
+			const key = `${request.model?.provider}\0${request.model?.api}\0${request.model?.id}`;
+			if (!allowed.has(key)) throw new Error("Model is outside this run's broker capability");
+			if (!request.context || !Array.isArray(request.context.messages)) throw new Error("Invalid broker context");
+			const model = options.modelRegistry.find(request.model.provider, request.model.id) as Model<any> | undefined;
+			if (!model || model.api !== request.model.api) throw new Error("Requested model is unavailable");
+			const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? "Provider is not authenticated" : auth.error);
+			const maxTokens = Math.min(
+				Number.isInteger(request.options?.maxTokens) ? Math.max(1, request.options!.maxTokens!) : maxOutputTokens,
 				maxOutputTokens,
 				model.maxTokens,
-			),
-		);
-		const providerStream = streamSimple(model, request.context, {
-			...request.options,
-			maxTokens,
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			signal: abort.signal,
-		});
-		for await (const event of providerStream) {
-			if (abort.signal.aborted) break;
-			await writeFrame(socket, {
-				type: "event",
-				id: request.id,
-				event: redactSecrets(event, [auth.apiKey, ...Object.values(auth.headers ?? {})]),
+				remainingOutputTokens,
+			);
+			if (maxTokens < 1) throw new Error("Broker total output token budget exhausted");
+			remainingOutputTokens -= maxTokens;
+			const providerStream = streamSimple(model, request.context, {
+				...request.options,
+				maxTokens,
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				signal: abort.signal,
 			});
-			if (event.type === "done" || event.type === "error") break;
+			for await (const event of providerStream) {
+				if (abort.signal.aborted) break;
+				await writeFrame(socket, {
+					type: "event",
+					id: request.id,
+					event: redactSecrets(event, [auth.apiKey, ...Object.values(auth.headers ?? {})]),
+				});
+				if (event.type === "done" || event.type === "error") break;
+			}
+		} finally {
+			activeRequest = false;
 		}
 	}
 
