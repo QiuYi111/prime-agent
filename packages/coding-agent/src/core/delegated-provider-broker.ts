@@ -6,9 +6,9 @@ import { type Context, type Model, type SimpleStreamOptions, streamSimple } from
 import type { ModelRegistry } from "./model-registry.js";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
-const MAX_REQUESTS_PER_BROKER = 8;
-const MAX_OUTPUT_TOKENS_PER_REQUEST = 512;
-const MAX_TOTAL_OUTPUT_TOKENS = 2048;
+const MAX_REQUESTS_PER_BROKER = 128;
+const MAX_OUTPUT_TOKENS_PER_REQUEST = 4096;
+const MAX_TOTAL_OUTPUT_TOKENS = 32768;
 
 export interface DelegatedProviderBrokerOptions {
 	socketPath: string;
