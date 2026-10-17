@@ -6,9 +6,9 @@ import { type Context, type Model, type SimpleStreamOptions, streamSimple } from
 import type { ModelRegistry } from "./model-registry.js";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
-const MAX_REQUESTS_PER_BROKER = 128;
-const MAX_OUTPUT_TOKENS_PER_REQUEST = 4096;
-const MAX_TOTAL_OUTPUT_TOKENS = 32768;
+const MAX_REQUESTS_PER_BROKER = 10_000;
+const MAX_OUTPUT_TOKENS_PER_REQUEST = 8_192;
+const MAX_TOTAL_OUTPUT_TOKENS = 1_000_000;
 
 export interface DelegatedProviderBrokerOptions {
 	socketPath: string;
@@ -54,6 +54,7 @@ export async function startDelegatedProviderBroker(
 	let requestCount = 0;
 	let connectionCount = 0;
 	let activeRequest = false;
+	let requestQueue = Promise.resolve();
 	const sockets = new Set<Socket>();
 	const allowed = new Set(options.allowedModels.map((model) => `${model.provider}\0${model.api}\0${model.id}`));
 	if (allowed.size === 0) throw new Error("Broker requires at least one allowed model");
@@ -68,7 +69,12 @@ export async function startDelegatedProviderBroker(
 		}
 		sockets.add(socket);
 		socket.once("close", () => sockets.delete(socket));
-		void serveRequest(socket).catch(() => socket.destroy());
+		const work = requestQueue.then(() => serveRequest(socket));
+		requestQueue = work.catch(() => undefined);
+		void work.catch((error) => {
+			process.stderr.write(`provider broker error: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+			socket.destroy();
+		});
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
