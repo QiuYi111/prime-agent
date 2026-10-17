@@ -1762,8 +1762,26 @@ async function generateModels() {
 
 	const deepseekV4Models: Model<"openai-completions">[] = [
 		{
+			id: "deepseek-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			baseUrl: "https://api.deepseek.com",
+			provider: "deepseek",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0.14,
+				output: 0.28,
+				cacheRead: 0.0028,
+				cacheWrite: 0,
+			},
+			contextWindow: 1000000,
+			maxTokens: 384000,
+			compat: DEEPSEEK_V4_COMPAT,
+		},
+		{
 			id: "deepseek-v4-flash",
-			name: "DeepSeek V4 Flash",
+			name: "DeepSeek V4 Flash (legacy alias)",
 			api: "openai-completions",
 			baseUrl: "https://api.deepseek.com",
 			provider: "deepseek",

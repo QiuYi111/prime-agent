@@ -104,6 +104,14 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
 	});
 
+	it("includes the current DeepSeek V4.1 Flash model with 1M context", () => {
+		const model = getModel("deepseek", "deepseek-flash");
+		expect(model?.name).toBe("DeepSeek V4.1 Flash");
+		expect(model?.contextWindow).toBe(1_000_000);
+		expect(model?.maxTokens).toBe(384_000);
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
+	});
+
 	it("includes only high/xhigh plus off for DeepSeek V4 Flash on opencode-go", () => {
 		const model = getModel("opencode-go", "deepseek-v4-flash");
 		expect(model).toBeDefined();
