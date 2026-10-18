@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -79,7 +79,9 @@ dependencies = ["${dependencyName}"]
 }
 
 function writeFakePython(filePath: string, importableModules: readonly string[]): void {
-	const cases = importableModules.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
+	const modules = new Set(importableModules);
+	if (modules.has("rlm")) modules.add("ipykernel");
+	const cases = [...modules].map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
 	const runtimeCase = importableModules.includes("rlm") ? '    *"_harness_methods"*) exit 0 ;;' : "";
 	writeExecutable(
 		filePath,
@@ -102,7 +104,7 @@ function installFakeUv(): string {
 	const binDir = join(tempDir, "bin");
 	mkdirSync(binDir, { recursive: true });
 	const logPath = join(tempDir, "uv.log");
-	const extraImportCases = DEFAULT_RLM_EXTRA_IMPORT_NAMES.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`);
+		const extraImportCases = ["ipykernel", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].map((moduleName) => `    "import ${moduleName}") exit 0 ;;`);
 	process.env.UV_LOG = logPath;
 	process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
 	writeExecutable(
@@ -373,7 +375,7 @@ dependencies = ["httpx"]
 		).toHaveLength(2);
 	});
 
-	it("rebuilds a warm venv with legacy unhashed Python skill manifest entries", async () => {
+	it("keeps a warm venv with legacy unhashed Python skill manifest entries", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
@@ -399,7 +401,9 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").not.toContain(
+			`venv ${venv} --python 3.11 --seed`,
+		);
 	});
 
 	it("shares concurrent bootstrap work in one process", async () => {
@@ -425,7 +429,22 @@ dependencies = ["httpx"]
 		await expect(ensureKernelPython()).resolves.toBe(python);
 	});
 
-	it("rebuilds a warm venv whose recorded runtime hash no longer matches local source", async () => {
+	it("keeps a usable offline venv when its bootstrap version marker is stale", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["rlm"]);
+		writeFileSync(join(venv, ".bootstrap-version"), `{"schema":0}\n`);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").not.toContain("python install");
+		expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").not.toContain(`venv ${venv} --python`);
+	});
+
+	it("keeps a warm venv whose recorded runtime hash no longer matches local source", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
@@ -445,9 +464,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
-		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
-		expect(version.runtime).toBe(runtimeIdentity);
+		expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").not.toContain(`venv ${venv} --python 3.11 --seed`);
 	});
 
 	it("rebuilds a warm venv with a stale rlm runtime", async () => {

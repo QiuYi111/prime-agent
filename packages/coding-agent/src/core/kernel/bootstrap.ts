@@ -446,6 +446,11 @@ async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
 	}
 }
 
+/** A ready kernel venv also needs the kernel package itself on its import path. */
+function hasIpykernel(python: string): Promise<boolean> {
+	return pythonImports(python, "ipykernel");
+}
+
 async function missingRlmExtraImportLabels(python: string): Promise<string[]> {
 	const missing: string[] = [];
 	for (const pkg of DEFAULT_RLM_EXTRA_PACKAGES) {
@@ -852,11 +857,14 @@ async function syncPythonSkills(
 	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 }
 
-async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
-	return (
-		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
-	);
+/**
+ * A venv is usable as soon as it can run the runtime and start a kernel;
+ * the `.bootstrap-version` stamp only tells us whether an upgrade is still
+ * worth attempting. Making the stamp a readiness gate turned a stale marker in
+ * a pre-installed image into a full offline rebuild.
+ */
+async function kernelBaseReady(python: string): Promise<boolean> {
+	return (await hasIpykernel(python)) && (await hasPrimeAgentRuntime(python));
 }
 
 async function kernelReady(
@@ -925,7 +933,7 @@ async function ensureKernelPythonUncached(
 	const releaseLock = await acquireBootstrapLock(venv);
 	try {
 		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
+		if (await kernelBaseReady(python)) {
 			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
 			return python;
 		}
