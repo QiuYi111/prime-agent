@@ -69,7 +69,10 @@ export async function startDelegatedProviderBroker(
 		}
 		sockets.add(socket);
 		socket.once("close", () => sockets.delete(socket));
-		void serveRequest(socket).catch(() => socket.destroy());
+		void serveRequest(socket).catch((error) => {
+			console.error("[delegated-provider-broker] request failed", error);
+			socket.destroy();
+		});
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -91,7 +94,12 @@ export async function startDelegatedProviderBroker(
 		if (++requestCount > maxRequests) throw new Error("Broker request limit reached");
 		{
 			const key = `${request.model?.provider}\0${request.model?.api}\0${request.model?.id}`;
-			if (!allowed.has(key)) throw new Error("Model is outside this run's broker capability");
+			if (!allowed.has(key)) {
+				const sameProvider = options.allowedModels
+					.filter((model) => model.provider === request.model?.provider)
+					.map(({ provider, api, id }) => ({ provider, api, id }));
+				throw new Error(`Model is outside this run's broker capability: requested=${JSON.stringify(request.model)} sameProvider=${JSON.stringify(sameProvider)}`);
+			}
 			if (!request.context || !Array.isArray(request.context.messages)) throw new Error("Invalid broker context");
 			const model = options.modelRegistry.find(request.model.provider, request.model.id) as Model<any> | undefined;
 			if (!model || model.api !== request.model.api) throw new Error("Requested model is unavailable");

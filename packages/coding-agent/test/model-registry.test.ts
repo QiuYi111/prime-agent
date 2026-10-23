@@ -266,6 +266,21 @@ describe("ModelRegistry", () => {
 			expect(registry.getError()).toContain("baseUrl");
 		});
 
+		test("custom provider accepts an API key stored outside models.json", () => {
+			authStorage.set("local-e2e", { type: "api_key", key: "stored-key" });
+			writeRawModelsJson({
+				"local-e2e": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-completions",
+					models: [{ id: "reify-e2e", reasoning: false, input: ["text"] }],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("local-e2e", "reify-e2e")).toBeDefined();
+		});
+
 		test("custom provider with same name as built-in merges with built-in models", () => {
 			writeModelsJson({
 				anthropic: providerConfig("https://my-proxy.example.com/v1", [{ id: "claude-custom" }]),
