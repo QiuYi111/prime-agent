@@ -196,7 +196,7 @@ describe("trusted SDK provider broker", () => {
 		expect(hostReasoning).toBe("low");
 	});
 
-	it("caps aggregate output tokens across serial provider calls", async () => {
+	it("caps aggregate output tokens across provider calls", async () => {
 		const observed: number[] = [];
 		const stream = (_model: any, _context: any, options: any): AssistantMessageEventStream => {
 			observed.push(options.maxTokens);
@@ -214,6 +214,64 @@ describe("trusted SDK provider broker", () => {
 		for await (const _event of exhausted) { }
 		expect((await exhausted.result()).stopReason).toBe("error");
 		expect(observed).toEqual([8, 4]);
+	});
+
+	it("serves a second provider call while the first is still streaming", async () => {
+		const withTimeout = <T>(promise: Promise<T>): Promise<T | "timeout"> =>
+			Promise.race([promise, new Promise<"timeout">((resolve) => {
+				setTimeout(() => resolve("timeout"), 5_000).unref();
+			})]);
+		let arrivals = 0;
+		let firstArrived!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			firstArrived = resolve;
+		});
+		let releaseFirst!: () => void;
+		const firstReleased = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const stream = (_model: any, _context: any, _options: any): AssistantMessageEventStream => {
+			const result = createAssistantMessageEventStream();
+			const message: AssistantMessage = { role: "assistant", content: [], api: "broker-test-api", provider: "broker-test", model: "model-1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
+			arrivals += 1;
+			result.push({ type: "start", partial: message });
+			if (arrivals === 1) {
+				firstArrived();
+				void firstReleased.then(() => result.push({ type: "done", reason: "stop", message }));
+			} else {
+				result.push({ type: "done", reason: "stop", message });
+			}
+			return result;
+		};
+		registerApiProvider({ api: "broker-test-api", stream, streamSimple: stream });
+		root = await mkdtemp(join(tmpdir(), "pi-provider-broker-concurrent-"));
+		const socketPath = join(root, "provider.sock"), capability = "broker-capability-that-is-only-valid-for-this-test-123456", registry = modelRegistry();
+		broker = await startDelegatedProviderBroker({
+			socketPath,
+			capability,
+			modelRegistry: registry,
+			allowedModels: [{ provider: "broker-test", api: "broker-test-api", id: "model-1" }],
+		});
+		const adapter = createDelegatedProviderAdapter({ socketPath, capability }), model = registry.find("broker-test", "model-1")!;
+		const first = adapter.streamSimple(model, { messages: [] }, {});
+		const drainFirst = (async () => {
+			for await (const _event of first) {
+				// Hold the first request open until the assertion below finishes.
+			}
+		})();
+		expect(await withTimeout(firstStarted)).not.toBe("timeout");
+		const second = adapter.streamSimple(model, { messages: [] }, {});
+		const secondResult = await withTimeout((async () => {
+			for await (const _event of second) {
+				// Drain the reply emitted while the first request is still open.
+			}
+			return second.result();
+		})());
+		expect(secondResult).not.toBe("timeout");
+		if (secondResult === "timeout") throw new Error("unreachable");
+		expect(secondResult.stopReason).toBe("stop");
+		releaseFirst();
+		await withTimeout(drainFirst);
 	});
 
 	it("refreshes OAuth only in the host before dispatching the provider stream", async () => {

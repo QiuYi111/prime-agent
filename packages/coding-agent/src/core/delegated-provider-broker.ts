@@ -6,9 +6,11 @@ import { type Context, type Model, type SimpleStreamOptions, streamSimple } from
 import type { ModelRegistry } from "./model-registry.js";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
-const MAX_REQUESTS_PER_BROKER = 8;
-const MAX_OUTPUT_TOKENS_PER_REQUEST = 512;
-const MAX_TOTAL_OUTPUT_TOKENS = 2048;
+// One broker serves a whole tool-use session, so the defaults must cover a full
+// engineering run rather than a single subagent exchange.
+const MAX_REQUESTS_PER_BROKER = 10_000;
+const MAX_OUTPUT_TOKENS_PER_REQUEST = 8_192;
+const MAX_TOTAL_OUTPUT_TOKENS = 1_000_000;
 
 export interface DelegatedProviderBrokerOptions {
 	socketPath: string;
@@ -53,7 +55,6 @@ export async function startDelegatedProviderBroker(
 	let remainingOutputTokens = Math.min(options.maxTotalOutputTokens ?? MAX_TOTAL_OUTPUT_TOKENS, MAX_TOTAL_OUTPUT_TOKENS);
 	let requestCount = 0;
 	let connectionCount = 0;
-	let activeRequest = false;
 	const sockets = new Set<Socket>();
 	const allowed = new Set(options.allowedModels.map((model) => `${model.provider}\0${model.api}\0${model.id}`));
 	if (allowed.size === 0) throw new Error("Broker requires at least one allowed model");
@@ -68,7 +69,10 @@ export async function startDelegatedProviderBroker(
 		}
 		sockets.add(socket);
 		socket.once("close", () => sockets.delete(socket));
-		void serveRequest(socket).catch(() => socket.destroy());
+		void serveRequest(socket).catch((error) => {
+			console.error("[delegated-provider-broker] request failed", error);
+			socket.destroy();
+		});
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -88,16 +92,22 @@ export async function startDelegatedProviderBroker(
 			throw new Error("Invalid broker request");
 		if (!equalCapability(request.capability, options.capability)) throw new Error("Invalid broker capability");
 		if (++requestCount > maxRequests) throw new Error("Broker request limit reached");
-		if (activeRequest) throw new Error("Broker accepts only serial requests");
-		activeRequest = true;
-		try {
+		{
 			const key = `${request.model?.provider}\0${request.model?.api}\0${request.model?.id}`;
-			if (!allowed.has(key)) throw new Error("Model is outside this run's broker capability");
+			if (!allowed.has(key)) {
+				const sameProvider = options.allowedModels
+					.filter((model) => model.provider === request.model?.provider)
+					.map(({ provider, api, id }) => ({ provider, api, id }));
+				throw new Error(`Model is outside this run's broker capability: requested=${JSON.stringify(request.model)} sameProvider=${JSON.stringify(sameProvider)}`);
+			}
 			if (!request.context || !Array.isArray(request.context.messages)) throw new Error("Invalid broker context");
 			const model = options.modelRegistry.find(request.model.provider, request.model.id) as Model<any> | undefined;
 			if (!model || model.api !== request.model.api) throw new Error("Requested model is unavailable");
 			const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? "Provider is not authenticated" : auth.error);
+			// Requests run concurrently. Reserving after the last await keeps the
+			// clamp, the check and the decrement in one synchronous block, so the
+			// shared budget can never be overspent.
 			const maxTokens = Math.min(
 				Number.isInteger(request.options?.maxTokens) ? Math.max(1, request.options!.maxTokens!) : maxOutputTokens,
 				maxOutputTokens,
@@ -122,8 +132,6 @@ export async function startDelegatedProviderBroker(
 				});
 				if (event.type === "done" || event.type === "error") break;
 			}
-		} finally {
-			activeRequest = false;
 		}
 	}
 

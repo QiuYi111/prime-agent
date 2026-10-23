@@ -1,9 +1,29 @@
-import { type MermaidArt, render, type Span } from "grok-mermaid";
+import type { MermaidArt, Span } from "grok-mermaid";
 import { Marked, type Token } from "marked";
 import type { MermaidRenderingMode } from "../../../core/settings-manager.js";
 import type { Theme } from "../theme/theme.js";
 
 const markdownParser = new Marked();
+
+/**
+ * `grok-mermaid` is an optional renderer: a relocated or trimmed install may
+ * ship without it. Loading it lazily keeps the module graph loadable and lets a
+ * diagram fall back to its original fenced text instead of crashing the TUI.
+ */
+type MermaidModule = typeof import("grok-mermaid");
+let mermaidModule: MermaidModule | undefined;
+let mermaidLoad: Promise<void> | undefined;
+
+function loadMermaid(): Promise<void> {
+	mermaidLoad ??= import("grok-mermaid")
+		.then((module) => {
+			mermaidModule = module;
+		})
+		.catch(() => {
+			mermaidModule = undefined;
+		});
+	return mermaidLoad;
+}
 
 interface MermaidTransformOptions {
 	getMode: () => MermaidRenderingMode;
@@ -50,6 +70,9 @@ function themedLines(art: MermaidArt, theme: Theme): string[] {
 
 /** Create a transform that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
 export function createMermaidMarkdownTransform(options: MermaidTransformOptions): MermaidMarkdownTransform {
+	// Start the optional import during construction so an interactive session has
+	// the renderer ready long before the first diagram streams in.
+	void loadMermaid();
 	return (markdown, availableWidth, isStreaming) => {
 		const mode = options.getMode();
 		if (mode === "off" || (isStreaming && mode !== "streaming")) {
@@ -60,7 +83,11 @@ export function createMermaidMarkdownTransform(options: MermaidTransformOptions)
 			.lexer(markdown)
 			.map((token) => {
 				if (!isMermaid(token)) return token.raw;
-				const art = render(token.text);
+				if (!mermaidModule) {
+					void loadMermaid();
+					return token.raw;
+				}
+				const art = mermaidModule.render(token.text);
 				if (!art || art.width > availableWidth) return token.raw;
 				if (!isStreaming && art.warnings.length > 0) {
 					const suffix = art.warnings.length > 1 ? ` (+${art.warnings.length - 1} more)` : "";

@@ -14,9 +14,6 @@ const SETTLE_DEBOUNCE_MS = 2_000;
 const IDLE_GENERATION_ATTEMPT_LIMIT = 3;
 const IDLE_GENERATION_RETRY_BACKOFF_MS = 30 * 60_000;
 
-const SUMMARY_MODEL_PROVIDER = "prime-inference";
-const SUMMARY_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507";
-
 const SUMMARY_CONTEXT_MESSAGES = 8;
 const SUMMARY_MAX_CHARS_PER_MESSAGE = 600;
 // Generous so a chatty model still closes the tags before truncation.
@@ -42,9 +39,24 @@ export interface AgentStatusResult {
 	taskState?: AgentTaskState;
 }
 
-/** Resolve the cheap summary model, or undefined when it has no configured auth. */
+/**
+ * The background status summarizer is opt-in. A deployment names its provider
+ * and model through PRIME_SUMMARY_PROVIDER / PRIME_SUMMARY_MODEL. Without both
+ * it stays silent rather than falling back to a provider this install may have
+ * no credentials for, so a stock checkout never reaches an unexpected host.
+ */
+export function summaryModelTarget(env: NodeJS.ProcessEnv = process.env): { provider: string; model: string } | undefined {
+	const provider = env.PRIME_SUMMARY_PROVIDER?.trim();
+	const model = env.PRIME_SUMMARY_MODEL?.trim();
+	if (!provider || !model) return undefined;
+	return { provider, model };
+}
+
+/** Resolve the cheap summary model, or undefined when it is unset or unauthenticated. */
 export function resolveSummaryModel(registry: ModelRegistry): Model<Api> | undefined {
-	const model = registry.find(SUMMARY_MODEL_PROVIDER, SUMMARY_MODEL_ID);
+	const target = summaryModelTarget();
+	if (!target) return undefined;
+	const model = registry.find(target.provider, target.model);
 	if (model && registry.hasConfiguredAuth(model)) {
 		return model;
 	}

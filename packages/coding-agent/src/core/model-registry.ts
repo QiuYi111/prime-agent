@@ -720,7 +720,7 @@ export class ModelRegistry {
 				if (!providerConfig.baseUrl) {
 					throw new Error(`Provider ${providerName}: "baseUrl" is required when defining custom models.`);
 				}
-				if (!providerConfig.apiKey) {
+				if (!providerConfig.apiKey && !this.authStorage.hasAuth(providerName)) {
 					throw new Error(`Provider ${providerName}: "apiKey" is required when defining custom models.`);
 				}
 			}
